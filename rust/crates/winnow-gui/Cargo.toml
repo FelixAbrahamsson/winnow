@@ -1,0 +1,15 @@
+[package]
+name = "winnow-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "winnow"
+path = "src/main.rs"
+
+[dependencies]
+winnow-core = { path = "../winnow-core" }
+# Target GTK 4.6 (Pop!_OS 22.04 / Ubuntu jammy baseline); raise the feature
+# later for newer APIs if desired.
+gtk4 = { version = "0.9", features = ["v4_6"] }
