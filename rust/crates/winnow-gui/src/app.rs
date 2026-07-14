@@ -2,8 +2,10 @@
 //! view state, with methods wired to GTK event controllers.
 
 pub mod desktop;
+mod grid;
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
@@ -76,6 +78,13 @@ pub struct App {
     sort_keys: Vec<(String, String)>,
     sort_dropdown: gtk4::DropDown,
     desc_check: gtk4::CheckButton,
+    stack: gtk4::Stack,
+    grid_view: gtk4::GridView,
+    grid_model: gtk4::StringList,
+    grid_selection: gtk4::MultiSelection,
+    grid_factory: gtk4::SignalListItemFactory,
+    thumb_cache: RefCell<HashMap<PathBuf, gdk::Texture>>,
+    in_grid: Cell<bool>,
     orig_pixbuf: RefCell<Option<Pixbuf>>,
     cur_path: RefCell<PathBuf>,
     scale: Cell<f64>,
@@ -216,12 +225,28 @@ impl App {
         hbox.append(&gtk4::Separator::new(Orientation::Vertical));
         hbox.append(&info_panel);
 
+        // ---- thumbnail grid page ----
+        let grid_model = gtk4::StringList::new(&[]);
+        let grid_selection = gtk4::MultiSelection::new(Some(grid_model.clone()));
+        let grid_factory = gtk4::SignalListItemFactory::new();
+        let grid_view =
+            gtk4::GridView::new(Some(grid_selection.clone()), Some(grid_factory.clone()));
+        grid_view.set_min_columns(2);
+        grid_view.set_max_columns(16);
+        grid_view.set_enable_rubberband(true);
+        let grid_scroll =
+            ScrolledWindow::builder().hexpand(true).vexpand(true).child(&grid_view).build();
+
+        let stack = gtk4::Stack::new();
+        stack.add_named(&hbox, Some("single"));
+        stack.add_named(&grid_scroll, Some("grid"));
+
         let window = ApplicationWindow::builder()
             .application(gtkapp)
             .title("winnow")
             .default_width(1280)
             .default_height(820)
-            .child(&hbox)
+            .child(&stack)
             .build();
 
         let app = Rc::new(App {
@@ -235,6 +260,13 @@ impl App {
             sort_keys,
             sort_dropdown,
             desc_check,
+            stack,
+            grid_view,
+            grid_model,
+            grid_selection,
+            grid_factory,
+            thumb_cache: RefCell::new(HashMap::new()),
+            in_grid: Cell::new(false),
             orig_pixbuf: RefCell::new(None),
             cur_path: RefCell::new(PathBuf::new()),
             scale: Cell::new(1.0),
@@ -598,6 +630,7 @@ impl App {
         self.build_drag_source();
         self.build_context_menu();
         self.build_info_controls();
+        self.build_grid();
     }
 
     fn build_info_controls(self: &Rc<Self>) {
@@ -783,6 +816,51 @@ impl App {
             let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
             let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
 
+            // Grid mode: bucket keys move the selection; arrows/rubber-band are
+            // left to the GridView.
+            if app.in_grid.get() {
+                if ctrl && keyval == gdk::Key::z {
+                    if shift {
+                        app.redo();
+                    } else {
+                        app.undo();
+                    }
+                    app.sync_grid_model();
+                    return Stop;
+                }
+                if !ctrl {
+                    if let Some(kn) = keyval.name() {
+                        let kn = kn.to_string();
+                        let bidx = app
+                            .session
+                            .borrow()
+                            .buckets
+                            .iter()
+                            .position(|b| b.key.eq_ignore_ascii_case(&kn))
+                            .or_else(|| {
+                                if kn.eq_ignore_ascii_case("BackSpace")
+                                    || kn.eq_ignore_ascii_case("x")
+                                {
+                                    Some(0)
+                                } else {
+                                    None
+                                }
+                            });
+                        if let Some(i) = bidx {
+                            app.move_selected(i);
+                            return Stop;
+                        }
+                    }
+                }
+                match keyval {
+                    gdk::Key::g => app.toggle_view(),
+                    gdk::Key::Return | gdk::Key::KP_Enter => app.open_selected(),
+                    gdk::Key::Escape => app.toggle_view(),
+                    _ => return Proceed,
+                }
+                return Stop;
+            }
+
             if ctrl {
                 match keyval {
                     gdk::Key::z if shift => app.redo(),
@@ -855,6 +933,7 @@ impl App {
                 gdk::Key::backslash => app.reset_adjustments(),
                 gdk::Key::F11 => app.toggle_fullscreen(),
                 gdk::Key::i => app.toggle_info(),
+                gdk::Key::g => app.toggle_view(),
                 gdk::Key::question | gdk::Key::F1 => app.show_help(),
                 _ => return Proceed,
             }

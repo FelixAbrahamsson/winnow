@@ -255,6 +255,27 @@ impl Session {
         })
     }
 
+    /// Move several images (by list position) into a bucket. Each is an
+    /// independent undo step. Returns the number moved.
+    pub fn move_positions(&mut self, positions: &[usize], bucket_idx: usize) -> usize {
+        let mut sorted: Vec<usize> = positions.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut moved = 0;
+        // Move highest index first so earlier indices stay valid.
+        for &pos in sorted.iter().rev() {
+            if let Some(op) = self.do_move(pos, bucket_idx) {
+                self.undo_stack.push(op);
+                moved += 1;
+            }
+        }
+        if moved > 0 {
+            self.redo_stack.clear();
+            self.clamp_index();
+        }
+        moved
+    }
+
     pub fn undo(&mut self) -> Option<String> {
         let op = self.undo_stack.pop()?;
         let restore = unique_dest(&op.from_abs);
@@ -355,6 +376,21 @@ mod tests {
         assert_eq!(s.index, 0);
         assert_eq!(s.items[0].name(), "img_003.jpg");
         assert_eq!(s.items[3].name(), "img_000.jpg");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn move_positions_bulk() {
+        let (root, mut s) = make_session(6);
+        let moved = s.move_positions(&[0, 2, 4], 0);
+        assert_eq!(moved, 3);
+        assert_eq!(s.count(), 3);
+        assert!(root.join("_rejected/img_000.jpg").exists());
+        assert!(root.join("_rejected/img_002.jpg").exists());
+        assert!(root.join("_rejected/img_004.jpg").exists());
+        // remaining are the odd ones
+        let names: Vec<String> = s.items.iter().map(|i| i.name()).collect();
+        assert_eq!(names, vec!["img_001.jpg", "img_003.jpg", "img_005.jpg"]);
         let _ = fs::remove_dir_all(&root);
     }
 
