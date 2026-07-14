@@ -18,7 +18,7 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, DragSource, EventControllerKey, EventControllerScroll,
-    EventControllerScrollFlags, Picture, PropagationPhase, ScrolledWindow,
+    EventControllerScrollFlags, Label, Orientation, Picture, PropagationPhase, ScrolledWindow,
 };
 use winnow_core::Session;
 
@@ -69,6 +69,7 @@ fn build_ui(app: &Application) {
     let scale = Rc::new(Cell::new(1.0f64));
     let fitted = Rc::new(Cell::new(true)); // auto-fit until the user manually zooms
     let cur_path = Rc::new(RefCell::new(PathBuf::new()));
+    let msg_gen = Rc::new(Cell::new(0u64)); // to expire transient status messages
 
     let picture = Picture::new();
     picture.set_keep_aspect_ratio(true);
@@ -79,12 +80,25 @@ fn build_ui(app: &Application) {
     let scroller = ScrolledWindow::builder().hexpand(true).vexpand(true).child(&picture).build();
     scroller.set_kinetic_scrolling(false);
 
+    // Bottom status bar: "N/M — name" plus transient action messages.
+    let status = Label::builder()
+        .xalign(0.0)
+        .margin_start(8)
+        .margin_end(8)
+        .margin_top(3)
+        .margin_bottom(3)
+        .build();
+
+    let vbox = gtk4::Box::new(Orientation::Vertical, 0);
+    vbox.append(&scroller);
+    vbox.append(&status);
+
     let window = ApplicationWindow::builder()
         .application(app)
         .title("winnow")
         .default_width(1200)
         .default_height(800)
-        .child(&scroller)
+        .child(&vbox)
         .build();
 
     // Scale at which the image exactly fits the current viewport (None until
@@ -154,6 +168,22 @@ fn build_ui(app: &Application) {
         })
     };
 
+    // Persistent status line + window title: "N/M — relpath".
+    let update_status: Rc<dyn Fn()> = {
+        let session = session.clone();
+        let status = status.clone();
+        let window = window.clone();
+        Rc::new(move || {
+            let s = session.borrow();
+            let text = match s.current() {
+                Some(item) => format!("{}/{} — {}", s.index + 1, s.count(), item.rel_path),
+                None => "0/0 — empty".to_string(),
+            };
+            status.set_text(&text);
+            window.set_title(Some(&text));
+        })
+    };
+
     // Load and show the current image.
     let refresh: Rc<dyn Fn()> = {
         let session = session.clone();
@@ -161,45 +191,137 @@ fn build_ui(app: &Application) {
         let fitted = fitted.clone();
         let cur_path = cur_path.clone();
         let picture = picture.clone();
-        let window = window.clone();
         let apply_scale = apply_scale.clone();
         let viewport_fit = viewport_fit.clone();
+        let update_status = update_status.clone();
         Rc::new(move || {
-            let s = session.borrow();
-            if let Some(item) = s.current() {
-                *cur_path.borrow_mut() = item.abs_path.clone();
-                match gdk::Texture::from_filename(&item.abs_path) {
-                    Ok(tex) => {
-                        picture.set_paintable(Some(&tex));
-                        if fitted.get() {
-                            if let Some(f) = viewport_fit() {
-                                scale.set(f.min(1.0));
+            {
+                let s = session.borrow();
+                match s.current() {
+                    Some(item) => {
+                        *cur_path.borrow_mut() = item.abs_path.clone();
+                        match gdk::Texture::from_filename(&item.abs_path) {
+                            Ok(tex) => {
+                                picture.set_paintable(Some(&tex));
+                                if fitted.get() {
+                                    if let Some(f) = viewport_fit() {
+                                        scale.set(f.min(1.0));
+                                    }
+                                }
+                                apply_scale();
                             }
+                            Err(_) => picture.set_paintable(None::<&gdk::Texture>),
                         }
-                        apply_scale();
                     }
-                    Err(_) => picture.set_paintable(None::<&gdk::Texture>),
+                    None => picture.set_paintable(None::<&gdk::Texture>),
                 }
-                window.set_title(Some(&format!("{}/{} — {}", s.index + 1, s.count(), item.name())));
-            } else {
-                picture.set_paintable(None::<&gdk::Texture>);
-                window.set_title(Some("winnow — empty"));
             }
+            update_status();
         })
     };
 
-    // ---- keyboard: navigation & zoom ------------------------------
+    // Transient action message (reject/undo/copy), auto-reverting to the status.
+    let flash: Rc<dyn Fn(String)> = {
+        let status = status.clone();
+        let msg_gen = msg_gen.clone();
+        let update_status = update_status.clone();
+        Rc::new(move |text: String| {
+            let g = msg_gen.get().wrapping_add(1);
+            msg_gen.set(g);
+            status.set_text(&text);
+            let msg_gen = msg_gen.clone();
+            let update_status = update_status.clone();
+            glib::timeout_add_local_once(Duration::from_secs(4), move || {
+                if msg_gen.get() == g {
+                    update_status();
+                }
+            });
+        })
+    };
+
+    // ---- keyboard: navigation, buckets, undo, zoom ----------------
     let keys = EventControllerKey::new();
     {
         let session = session.clone();
         let refresh = refresh.clone();
+        let flash = flash.clone();
         let zoom = zoom.clone();
         let fit = fit.clone();
         let scale = scale.clone();
         let apply_scale = apply_scale.clone();
         let fitted = fitted.clone();
         let min_scale = min_scale.clone();
-        keys.connect_key_pressed(move |_c, keyval, _code, _mods| {
+        let window = window.clone();
+        keys.connect_key_pressed(move |_c, keyval, _code, state| {
+            use glib::Propagation::{Proceed, Stop};
+            let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+            let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
+
+            // Ctrl combos: undo/redo, copy filename.
+            if ctrl {
+                match keyval {
+                    gdk::Key::z if shift => {
+                        if let Some(m) = session.borrow_mut().redo() {
+                            flash(m);
+                        }
+                        refresh();
+                        return Stop;
+                    }
+                    gdk::Key::z => {
+                        if let Some(m) = session.borrow_mut().undo() {
+                            flash(m);
+                        }
+                        refresh();
+                        return Stop;
+                    }
+                    gdk::Key::y => {
+                        if let Some(m) = session.borrow_mut().redo() {
+                            flash(m);
+                        }
+                        refresh();
+                        return Stop;
+                    }
+                    gdk::Key::c => {
+                        let name = session.borrow().current().map(|i| i.name());
+                        if let Some(name) = name {
+                            window.clipboard().set_text(&name);
+                            flash(format!("Copied filename: {name}"));
+                        }
+                        return Stop;
+                    }
+                    _ => {}
+                }
+            }
+
+            // Bucket hotkeys (match by GDK key name, e.g. "Delete", "1", "c").
+            // Reject also answers to Backspace / x.
+            if !ctrl {
+                if let Some(kn) = keyval.name() {
+                    let kn = kn.to_string();
+                    let bidx = session
+                        .borrow()
+                        .buckets
+                        .iter()
+                        .position(|b| b.key.eq_ignore_ascii_case(&kn))
+                        .or_else(|| {
+                            if kn.eq_ignore_ascii_case("BackSpace") || kn.eq_ignore_ascii_case("x") {
+                                Some(0)
+                            } else {
+                                None
+                            }
+                        });
+                    if let Some(i) = bidx {
+                        let msg = session.borrow_mut().move_current_to(i);
+                        refresh();
+                        if let Some(m) = msg {
+                            flash(m);
+                        }
+                        return Stop;
+                    }
+                }
+            }
+
+            // Navigation & zoom.
             match keyval {
                 gdk::Key::Right | gdk::Key::space => {
                     session.borrow_mut().next();
@@ -212,14 +334,14 @@ fn build_ui(app: &Application) {
                 gdk::Key::plus | gdk::Key::equal => zoom(KEY_ZOOM_STEP),
                 gdk::Key::minus => zoom(1.0 / KEY_ZOOM_STEP),
                 gdk::Key::f => fit(),
-                gdk::Key::_1 => {
+                gdk::Key::a => {
                     scale.set(1.0f64.clamp(min_scale(), MAX_SCALE));
                     fitted.set(false);
                     apply_scale();
                 }
-                _ => return glib::Propagation::Proceed,
+                _ => return Proceed,
             }
-            glib::Propagation::Stop
+            Stop
         });
     }
     window.add_controller(keys);
