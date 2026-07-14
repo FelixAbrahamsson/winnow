@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+
+# winnow runtime
+# (thumbnail cache lives in ~/.cache/winnow, not in the repo)
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
