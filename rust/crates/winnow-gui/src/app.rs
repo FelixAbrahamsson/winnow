@@ -79,6 +79,26 @@ pub struct App {
     gamma: Cell<f64>,
     msg_gen: Cell<u64>,
     pan_start: Cell<(f64, f64)>,
+    pan_active: Cell<bool>,
+}
+
+fn event_has_ctrl(ev: Option<gdk::Event>) -> bool {
+    ev.map(|e| e.modifier_state().contains(gdk::ModifierType::CONTROL_MASK)).unwrap_or(false)
+}
+
+#[derive(Clone, Copy)]
+enum MenuAction {
+    Next,
+    Prev,
+    Bucket(usize),
+    Undo,
+    Fit,
+    Actual,
+    Fullscreen,
+    CopyName,
+    CopyPath,
+    CopyFile,
+    Help,
 }
 
 impl App {
@@ -127,6 +147,7 @@ impl App {
             gamma: Cell::new(1.0),
             msg_gen: Cell::new(0),
             pan_start: Cell::new((0.0, 0.0)),
+            pan_active: Cell::new(false),
         });
 
         app.build_controllers();
@@ -233,6 +254,18 @@ impl App {
                 (p.intrinsic_height() as f64 * sc).round() as i32,
             );
         }
+        self.update_cursor();
+    }
+
+    fn update_cursor(&self) {
+        let name = if self.pan_active.get() {
+            "grabbing"
+        } else if self.can_pan() {
+            "grab"
+        } else {
+            "default"
+        };
+        self.picture.set_cursor_from_name(Some(name));
     }
 
     fn zoom(&self, factor: f64) {
@@ -365,12 +398,185 @@ impl App {
         }
     }
 
+    // ---- help ------------------------------------------------------
+    fn help_markup(&self) -> String {
+        fn row(key: &str, desc: &str) -> String {
+            format!("  <tt>{:<26}</tt> {}\n", key, glib::markup_escape_text(desc))
+        }
+        let mut buckets = String::new();
+        for b in &self.session.borrow().buckets {
+            if b.is_reject {
+                buckets.push_str(&row("Delete / Backspace / x", "Reject → move to _rejected/"));
+            } else {
+                buckets.push_str(&row(
+                    &glib::markup_escape_text(&b.key),
+                    &format!("Move to “{}” ({}/)", b.name, b.folder),
+                ));
+            }
+        }
+        format!(
+            "<b>Navigation</b>\n{nav}\n<b>Sort into buckets</b>\n{buckets}{undo}\n\
+             <b>Zoom &amp; pan</b>\n{zoom}\n<b>Image adjust</b>\n{adjust}\n\
+             <b>Files &amp; views</b>\n{files}",
+            nav = [
+                row("→ / Space", "Next image"),
+                row("←", "Previous image"),
+                row("Mouse Back / Forward", "Previous / next"),
+                row("Page Down / Page Up", "Jump ±10"),
+                row("Home / End", "First / last"),
+            ]
+            .concat(),
+            buckets = buckets,
+            undo = row("Ctrl+Z / Ctrl+Shift+Z", "Undo / redo the last move"),
+            zoom = [
+                row("Scroll / pinch", "Zoom (toward cursor)"),
+                row("+ / -", "Zoom in / out"),
+                row("f / a", "Fit to window / 100%"),
+                row("Left-drag (zoomed)", "Pan the image"),
+                row("Middle-drag", "Pan the image"),
+                row("Double-click", "Toggle fullscreen"),
+            ]
+            .concat(),
+            adjust = [
+                row("] / [", "Brightness up / down"),
+                row("} / {", "Gamma up / down"),
+                row("\\", "Reset brightness & gamma"),
+            ]
+            .concat(),
+            files = [
+                row("Left-drag (fit) / Ctrl+drag", "Drag file out (copy)"),
+                row("Ctrl+C / Ctrl+Shift+C", "Copy filename / path"),
+                row("Ctrl+Shift+X", "Copy image file to clipboard"),
+                row("F11", "Fullscreen"),
+                row("? / F1", "This shortcuts list"),
+            ]
+            .concat(),
+        )
+    }
+
+    fn show_help(self: &Rc<Self>) {
+        let label = Label::builder()
+            .use_markup(true)
+            .wrap(true)
+            .xalign(0.0)
+            .margin_top(12)
+            .margin_bottom(12)
+            .margin_start(14)
+            .margin_end(14)
+            .build();
+        label.set_markup(&self.help_markup());
+        let scroll =
+            ScrolledWindow::builder().hexpand(true).vexpand(true).child(&label).build();
+        let win = gtk4::Window::builder()
+            .title("winnow — shortcuts")
+            .transient_for(&self.window)
+            .modal(true)
+            .default_width(540)
+            .default_height(680)
+            .child(&scroll)
+            .build();
+        let key = EventControllerKey::new();
+        let w = win.clone();
+        key.connect_key_pressed(move |_c, k, _code, _s| {
+            if k == gdk::Key::Escape || k == gdk::Key::question || k == gdk::Key::F1 {
+                w.close();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        win.add_controller(key);
+        win.present();
+    }
+
     // ---- event controllers ----------------------------------------
     fn build_controllers(self: &Rc<Self>) {
         self.build_keys();
         self.build_scroll();
         self.build_mouse();
         self.build_drag_source();
+        self.build_context_menu();
+    }
+
+    fn menu_action(self: &Rc<Self>, a: MenuAction) {
+        match a {
+            MenuAction::Next => {
+                self.session.borrow_mut().next();
+                self.refresh();
+            }
+            MenuAction::Prev => {
+                self.session.borrow_mut().prev();
+                self.refresh();
+            }
+            MenuAction::Bucket(i) => self.move_to_bucket(i),
+            MenuAction::Undo => self.undo(),
+            MenuAction::Fit => self.fit(),
+            MenuAction::Actual => self.actual_size(),
+            MenuAction::Fullscreen => self.toggle_fullscreen(),
+            MenuAction::CopyName => self.copy_name(),
+            MenuAction::CopyPath => self.copy_path(),
+            MenuAction::CopyFile => self.copy_file(),
+            MenuAction::Help => self.show_help(),
+        }
+    }
+
+    fn build_context_menu(self: &Rc<Self>) {
+        let popover = gtk4::Popover::new();
+        popover.set_parent(&self.picture);
+        popover.set_has_arrow(false);
+        popover.set_halign(gtk4::Align::Start);
+
+        let vbox = gtk4::Box::new(Orientation::Vertical, 0);
+        vbox.set_width_request(240);
+
+        let mut items: Vec<(String, Option<MenuAction>)> =
+            vec![("Next  →".into(), Some(MenuAction::Next)), ("Previous  ←".into(), Some(MenuAction::Prev)), (String::new(), None)];
+        for (i, b) in self.session.borrow().buckets.iter().enumerate() {
+            let label = if b.is_reject {
+                format!("Reject  ({})", b.key)
+            } else {
+                format!("Move to “{}”  ({})", b.name, b.key)
+            };
+            items.push((label, Some(MenuAction::Bucket(i))));
+        }
+        items.push(("Undo  (Ctrl+Z)".into(), Some(MenuAction::Undo)));
+        items.push((String::new(), None));
+        items.push(("Fit to window  (f)".into(), Some(MenuAction::Fit)));
+        items.push(("Actual size  (a)".into(), Some(MenuAction::Actual)));
+        items.push(("Fullscreen  (F11)".into(), Some(MenuAction::Fullscreen)));
+        items.push((String::new(), None));
+        items.push(("Copy filename  (Ctrl+C)".into(), Some(MenuAction::CopyName)));
+        items.push(("Copy path  (Ctrl+Shift+C)".into(), Some(MenuAction::CopyPath)));
+        items.push(("Copy image file  (Ctrl+Shift+X)".into(), Some(MenuAction::CopyFile)));
+        items.push((String::new(), None));
+        items.push(("Shortcuts…  (?)".into(), Some(MenuAction::Help)));
+
+        for (label, action) in items {
+            match action {
+                None => vbox.append(&gtk4::Separator::new(Orientation::Horizontal)),
+                Some(action) => {
+                    let lbl = Label::builder().label(&label).xalign(0.0).build();
+                    let btn = gtk4::Button::builder().child(&lbl).build();
+                    btn.add_css_class("flat");
+                    let app = self.clone();
+                    let pop = popover.clone();
+                    btn.connect_clicked(move |_| {
+                        app.menu_action(action);
+                        pop.popdown();
+                    });
+                    vbox.append(&btn);
+                }
+            }
+        }
+        popover.set_child(Some(&vbox));
+
+        let click = GestureClick::new();
+        click.set_button(gdk::BUTTON_SECONDARY);
+        click.connect_pressed(move |_g, _n, x, y| {
+            popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover.popup();
+        });
+        self.picture.add_controller(click);
     }
 
     fn build_keys(self: &Rc<Self>) {
@@ -452,6 +658,7 @@ impl App {
                 gdk::Key::braceleft => app.bump_gamma(-GAMMA_STEP),
                 gdk::Key::backslash => app.reset_adjustments(),
                 gdk::Key::F11 => app.toggle_fullscreen(),
+                gdk::Key::question | gdk::Key::F1 => app.show_help(),
                 _ => return Proceed,
             }
             Stop
@@ -471,24 +678,18 @@ impl App {
     }
 
     fn build_mouse(self: &Rc<Self>) {
-        // Middle-drag pans the zoomed image.
-        let pan = GestureDrag::new();
-        pan.set_button(gdk::BUTTON_MIDDLE);
-        {
-            let app = self.clone();
-            pan.connect_drag_begin(move |_g, _x, _y| {
-                app.pan_start.set((app.scroller.hadjustment().value(), app.scroller.vadjustment().value()));
-            });
-        }
-        {
-            let app = self.clone();
-            pan.connect_drag_update(move |_g, ox, oy| {
-                let (sh, sv) = app.pan_start.get();
-                app.scroller.hadjustment().set_value(sh - ox);
-                app.scroller.vadjustment().set_value(sv - oy);
-            });
-        }
-        self.picture.add_controller(pan);
+        // Middle-drag always pans.
+        let mid = GestureDrag::new();
+        mid.set_button(gdk::BUTTON_MIDDLE);
+        self.wire_pan_gesture(&mid, false);
+        self.picture.add_controller(mid);
+
+        // Left-drag pans when zoomed in (else it becomes an OS drag-out; see
+        // build_drag_source). Ctrl forces drag-out even when zoomed.
+        let left = GestureDrag::new();
+        left.set_button(gdk::BUTTON_PRIMARY);
+        self.wire_pan_gesture(&left, true);
+        self.picture.add_controller(left);
 
         // Double-click toggles fullscreen; mouse Back/Forward navigate.
         let click = GestureClick::new();
@@ -511,12 +712,58 @@ impl App {
         self.picture.add_controller(click);
     }
 
+    /// Wire a GestureDrag to pan the scroller. `conditional` gestures (left
+    /// button) only pan when the image is zoomed and Ctrl isn't held, yielding
+    /// the sequence otherwise so the drag source can start an OS drag-out.
+    fn wire_pan_gesture(self: &Rc<Self>, g: &GestureDrag, conditional: bool) {
+        {
+            let app = self.clone();
+            g.connect_drag_begin(move |g, _x, _y| {
+                let active = !conditional || (app.can_pan() && !event_has_ctrl(g.current_event()));
+                app.pan_active.set(active);
+                if active {
+                    g.set_state(gtk4::EventSequenceState::Claimed);
+                    app.pan_start.set((
+                        app.scroller.hadjustment().value(),
+                        app.scroller.vadjustment().value(),
+                    ));
+                    app.update_cursor();
+                } else {
+                    g.set_state(gtk4::EventSequenceState::Denied);
+                }
+            });
+        }
+        {
+            let app = self.clone();
+            g.connect_drag_update(move |_g, ox, oy| {
+                if app.pan_active.get() {
+                    let (sh, sv) = app.pan_start.get();
+                    app.scroller.hadjustment().set_value(sh - ox);
+                    app.scroller.vadjustment().set_value(sv - oy);
+                }
+            });
+        }
+        {
+            let app = self.clone();
+            g.connect_drag_end(move |_g, _ox, _oy| {
+                if app.pan_active.get() {
+                    app.pan_active.set(false);
+                    app.update_cursor();
+                }
+            });
+        }
+    }
+
     fn build_drag_source(self: &Rc<Self>) {
         let drag = DragSource::new();
         drag.set_actions(gdk::DragAction::COPY);
         {
             let app = self.clone();
-            drag.connect_prepare(move |_src, _x, _y| {
+            drag.connect_prepare(move |src, _x, _y| {
+                // When zoomed and no Ctrl, left-drag pans instead of dragging out.
+                if app.can_pan() && !event_has_ctrl(src.current_event()) {
+                    return None;
+                }
                 let path = app.cur_path.borrow().clone();
                 if path.as_os_str().is_empty() {
                     return None;
