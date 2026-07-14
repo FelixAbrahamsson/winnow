@@ -1,56 +1,91 @@
-//! winnow GTK4 front-end (work in progress — the Rust rewrite).
-//!
-//! Prototype stage: proves the two riskiest pieces before building the rest —
-//!   * native OS drag-out (drag the image into a file manager to copy it), and
-//!   * a zoom/pan image viewer.
-//! Plus arrow-key navigation so it's testable. Grid, buckets, brightness,
-//! metadata panel, and desktop integration come next.
+//! winnow — GTK4 image culling tool (Rust rewrite). Entry point + CLI.
 
-use std::cell::{Cell, RefCell};
+mod app;
+
 use std::path::PathBuf;
-use std::rc::Rc;
-use std::time::Duration;
 
-use gtk4::gdk;
-use gtk4::gdk_pixbuf;
-use gtk4::gio;
-use gtk4::glib;
+use clap::Parser;
 use gtk4::prelude::*;
-use gtk4::{
-    Application, ApplicationWindow, DragSource, EventControllerKey, EventControllerScroll,
-    EventControllerScrollFlags, Label, Orientation, Picture, PropagationPhase, ScrolledWindow,
-};
+use gtk4::{gio, glib, Application};
 use winnow_core::Session;
 
+use app::App;
+
 const APP_ID: &str = "com.github.felixabrahamsson.winnow";
-const MIN_SCALE: f64 = 0.05; // absolute floor used only before the view is sized
-const MAX_SCALE: f64 = 40.0;
-const ZOOM_RATE: f64 = 1.1; // per unit of scroll delta (proportional to magnitude)
-const KEY_ZOOM_STEP: f64 = 1.25; // per +/- keypress
+const AUTO_METADATA: &[&str] = &["metadata.csv", "metadata.tsv", "metadata.json"];
+
+#[derive(Parser, Clone)]
+#[command(name = "winnow", about = "Fast keyboard-driven image culling / selection tool.")]
+struct Cli {
+    /// Folder of images, or a single image (opens its folder, starting on it).
+    folder: Option<PathBuf>,
+    /// Do not descend into subfolders (default: recurse).
+    #[arg(long)]
+    no_recursive: bool,
+    /// Metadata file (.csv/.tsv). Auto-detected as metadata.csv if omitted.
+    #[arg(long)]
+    metadata: Option<PathBuf>,
+    /// Bucket config TOML (default: .winnow.toml in the folder).
+    #[arg(long)]
+    buckets: Option<PathBuf>,
+    /// Initial sort key (name, path, mtime, size, meta:COLUMN).
+    #[arg(long)]
+    sort: Option<String>,
+    /// Sort descending.
+    #[arg(long)]
+    sort_desc: bool,
+    /// Register the "Open With -> Winnow" launcher and exit.
+    #[arg(long)]
+    install_desktop: bool,
+}
 
 fn main() -> glib::ExitCode {
-    let app = Application::builder().application_id(APP_ID).build();
-    app.connect_activate(build_ui);
-    // Handle our own positional folder arg rather than GApplication options.
-    app.run_with_args::<&str>(&[])
+    let cli = Cli::parse();
+
+    if cli.install_desktop {
+        match app::desktop::install_desktop() {
+            Ok(path) => {
+                println!("Installed launcher: {}", path.display());
+                println!("Right-click a folder or image -> Open With -> Winnow.");
+            }
+            Err(e) => {
+                eprintln!("winnow: {e}");
+                return glib::ExitCode::FAILURE;
+            }
+        }
+        return glib::ExitCode::SUCCESS;
+    }
+
+    let application = Application::builder()
+        .application_id(APP_ID)
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    application.connect_activate(move |gtkapp| activate(gtkapp, &cli));
+    application.run_with_args::<&str>(&[])
 }
 
-fn folder_arg() -> PathBuf {
-    std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-}
-
-fn build_ui(app: &Application) {
-    let target = folder_arg();
+fn activate(gtkapp: &Application, cli: &Cli) {
+    let target = cli
+        .folder
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let (root, start_file) = if target.is_file() {
         (target.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| target.clone()), Some(target.clone()))
     } else {
         (target, None)
     };
 
-    let session = match Session::new(&root, true, None, None) {
+    let meta = cli
+        .metadata
+        .clone()
+        .or_else(|| AUTO_METADATA.iter().map(|n| root.join(n)).find(|p| p.exists()));
+    if cli.metadata.is_none() {
+        if let Some(m) = &meta {
+            eprintln!("using metadata: {}", m.file_name().unwrap_or_default().to_string_lossy());
+        }
+    }
+
+    let session = match Session::new(&root, !cli.no_recursive, cli.buckets.as_deref(), meta.as_deref()) {
         Ok(mut s) => {
             if let Some(f) = &start_file {
                 if let Some(i) = s.items.iter().position(|it| &it.abs_path == f) {
@@ -65,341 +100,6 @@ fn build_ui(app: &Application) {
         }
     };
 
-    let session = Rc::new(RefCell::new(session));
-    let scale = Rc::new(Cell::new(1.0f64));
-    let fitted = Rc::new(Cell::new(true)); // auto-fit until the user manually zooms
-    let cur_path = Rc::new(RefCell::new(PathBuf::new()));
-    let msg_gen = Rc::new(Cell::new(0u64)); // to expire transient status messages
-
-    let picture = Picture::new();
-    picture.set_keep_aspect_ratio(true);
-    picture.set_can_shrink(true);
-    picture.set_halign(gtk4::Align::Center);
-    picture.set_valign(gtk4::Align::Center);
-
-    let scroller = ScrolledWindow::builder().hexpand(true).vexpand(true).child(&picture).build();
-    scroller.set_kinetic_scrolling(false);
-
-    // Bottom status bar: "N/M — name" plus transient action messages.
-    let status = Label::builder()
-        .xalign(0.0)
-        .margin_start(8)
-        .margin_end(8)
-        .margin_top(3)
-        .margin_bottom(3)
-        .build();
-
-    let vbox = gtk4::Box::new(Orientation::Vertical, 0);
-    vbox.append(&scroller);
-    vbox.append(&status);
-
-    let window = ApplicationWindow::builder()
-        .application(app)
-        .title("winnow")
-        .default_width(1200)
-        .default_height(800)
-        .child(&vbox)
-        .build();
-
-    // Scale at which the image exactly fits the current viewport (None until
-    // the view has been allocated a size).
-    let viewport_fit: Rc<dyn Fn() -> Option<f64>> = {
-        let picture = picture.clone();
-        let scroller = scroller.clone();
-        Rc::new(move || {
-            let p = picture.paintable()?;
-            let (iw, ih) = (p.intrinsic_width() as f64, p.intrinsic_height() as f64);
-            let (vw, vh) = (scroller.width() as f64, scroller.height() as f64);
-            if iw > 0.0 && ih > 0.0 && vw > 0.0 && vh > 0.0 {
-                Some((vw / iw).min(vh / ih))
-            } else {
-                None
-            }
-        })
-    };
-
-    // Smallest allowed zoom: fit-to-window, but never forcing upscaling of a
-    // small image beyond 100%.
-    let min_scale: Rc<dyn Fn() -> f64> = {
-        let viewport_fit = viewport_fit.clone();
-        Rc::new(move || viewport_fit().map(|f| f.min(1.0)).unwrap_or(MIN_SCALE))
-    };
-
-    let apply_scale: Rc<dyn Fn()> = {
-        let picture = picture.clone();
-        let scale = scale.clone();
-        Rc::new(move || {
-            if let Some(p) = picture.paintable() {
-                let sc = scale.get();
-                picture.set_size_request(
-                    (p.intrinsic_width() as f64 * sc).round() as i32,
-                    (p.intrinsic_height() as f64 * sc).round() as i32,
-                );
-            }
-        })
-    };
-
-    // Manual zoom by a relative factor, clamped to [fit, MAX]. Stops auto-fit.
-    let zoom: Rc<dyn Fn(f64)> = {
-        let scale = scale.clone();
-        let apply_scale = apply_scale.clone();
-        let min_scale = min_scale.clone();
-        let fitted = fitted.clone();
-        Rc::new(move |factor: f64| {
-            let s = (scale.get() * factor).clamp(min_scale(), MAX_SCALE);
-            scale.set(s);
-            fitted.set(false);
-            apply_scale();
-        })
-    };
-
-    // Fit the current image to the window (and re-enable auto-fit).
-    let fit: Rc<dyn Fn()> = {
-        let scale = scale.clone();
-        let apply_scale = apply_scale.clone();
-        let viewport_fit = viewport_fit.clone();
-        let fitted = fitted.clone();
-        Rc::new(move || {
-            if let Some(f) = viewport_fit() {
-                scale.set(f.min(1.0));
-                apply_scale();
-            }
-            fitted.set(true);
-        })
-    };
-
-    // Persistent status line + window title: "N/M — relpath".
-    let update_status: Rc<dyn Fn()> = {
-        let session = session.clone();
-        let status = status.clone();
-        let window = window.clone();
-        Rc::new(move || {
-            let s = session.borrow();
-            let text = match s.current() {
-                Some(item) => format!("{}/{} — {}", s.index + 1, s.count(), item.rel_path),
-                None => "0/0 — empty".to_string(),
-            };
-            status.set_text(&text);
-            window.set_title(Some(&text));
-        })
-    };
-
-    // Load and show the current image.
-    let refresh: Rc<dyn Fn()> = {
-        let session = session.clone();
-        let scale = scale.clone();
-        let fitted = fitted.clone();
-        let cur_path = cur_path.clone();
-        let picture = picture.clone();
-        let apply_scale = apply_scale.clone();
-        let viewport_fit = viewport_fit.clone();
-        let update_status = update_status.clone();
-        Rc::new(move || {
-            {
-                let s = session.borrow();
-                match s.current() {
-                    Some(item) => {
-                        *cur_path.borrow_mut() = item.abs_path.clone();
-                        match gdk::Texture::from_filename(&item.abs_path) {
-                            Ok(tex) => {
-                                picture.set_paintable(Some(&tex));
-                                if fitted.get() {
-                                    if let Some(f) = viewport_fit() {
-                                        scale.set(f.min(1.0));
-                                    }
-                                }
-                                apply_scale();
-                            }
-                            Err(_) => picture.set_paintable(None::<&gdk::Texture>),
-                        }
-                    }
-                    None => picture.set_paintable(None::<&gdk::Texture>),
-                }
-            }
-            update_status();
-        })
-    };
-
-    // Transient action message (reject/undo/copy), auto-reverting to the status.
-    let flash: Rc<dyn Fn(String)> = {
-        let status = status.clone();
-        let msg_gen = msg_gen.clone();
-        let update_status = update_status.clone();
-        Rc::new(move |text: String| {
-            let g = msg_gen.get().wrapping_add(1);
-            msg_gen.set(g);
-            status.set_text(&text);
-            let msg_gen = msg_gen.clone();
-            let update_status = update_status.clone();
-            glib::timeout_add_local_once(Duration::from_secs(4), move || {
-                if msg_gen.get() == g {
-                    update_status();
-                }
-            });
-        })
-    };
-
-    // ---- keyboard: navigation, buckets, undo, zoom ----------------
-    let keys = EventControllerKey::new();
-    {
-        let session = session.clone();
-        let refresh = refresh.clone();
-        let flash = flash.clone();
-        let zoom = zoom.clone();
-        let fit = fit.clone();
-        let scale = scale.clone();
-        let apply_scale = apply_scale.clone();
-        let fitted = fitted.clone();
-        let min_scale = min_scale.clone();
-        let window = window.clone();
-        keys.connect_key_pressed(move |_c, keyval, _code, state| {
-            use glib::Propagation::{Proceed, Stop};
-            let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
-            let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
-
-            // Ctrl combos: undo/redo, copy filename.
-            if ctrl {
-                match keyval {
-                    gdk::Key::z if shift => {
-                        if let Some(m) = session.borrow_mut().redo() {
-                            flash(m);
-                        }
-                        refresh();
-                        return Stop;
-                    }
-                    gdk::Key::z => {
-                        if let Some(m) = session.borrow_mut().undo() {
-                            flash(m);
-                        }
-                        refresh();
-                        return Stop;
-                    }
-                    gdk::Key::y => {
-                        if let Some(m) = session.borrow_mut().redo() {
-                            flash(m);
-                        }
-                        refresh();
-                        return Stop;
-                    }
-                    gdk::Key::c => {
-                        let name = session.borrow().current().map(|i| i.name());
-                        if let Some(name) = name {
-                            window.clipboard().set_text(&name);
-                            flash(format!("Copied filename: {name}"));
-                        }
-                        return Stop;
-                    }
-                    _ => {}
-                }
-            }
-
-            // Bucket hotkeys (match by GDK key name, e.g. "Delete", "1", "c").
-            // Reject also answers to Backspace / x.
-            if !ctrl {
-                if let Some(kn) = keyval.name() {
-                    let kn = kn.to_string();
-                    let bidx = session
-                        .borrow()
-                        .buckets
-                        .iter()
-                        .position(|b| b.key.eq_ignore_ascii_case(&kn))
-                        .or_else(|| {
-                            if kn.eq_ignore_ascii_case("BackSpace") || kn.eq_ignore_ascii_case("x") {
-                                Some(0)
-                            } else {
-                                None
-                            }
-                        });
-                    if let Some(i) = bidx {
-                        let msg = session.borrow_mut().move_current_to(i);
-                        refresh();
-                        if let Some(m) = msg {
-                            flash(m);
-                        }
-                        return Stop;
-                    }
-                }
-            }
-
-            // Navigation & zoom.
-            match keyval {
-                gdk::Key::Right | gdk::Key::space => {
-                    session.borrow_mut().next();
-                    refresh();
-                }
-                gdk::Key::Left => {
-                    session.borrow_mut().prev();
-                    refresh();
-                }
-                gdk::Key::plus | gdk::Key::equal => zoom(KEY_ZOOM_STEP),
-                gdk::Key::minus => zoom(1.0 / KEY_ZOOM_STEP),
-                gdk::Key::f => fit(),
-                gdk::Key::a => {
-                    scale.set(1.0f64.clamp(min_scale(), MAX_SCALE));
-                    fitted.set(false);
-                    apply_scale();
-                }
-                _ => return Proceed,
-            }
-            Stop
-        });
-    }
-    window.add_controller(keys);
-
-    // ---- scroll-to-zoom (proportional to delta; works anywhere) ---
-    // Capture phase + Stop so it fires before the ScrolledWindow pans.
-    let scroll = EventControllerScroll::new(EventControllerScrollFlags::VERTICAL);
-    scroll.set_propagation_phase(PropagationPhase::Capture);
-    {
-        let zoom = zoom.clone();
-        scroll.connect_scroll(move |_c, _dx, dy| {
-            // dy>0 = scroll down = zoom out. Proportional to magnitude, so a
-            // trackpad's many small deltas don't slam to the limit.
-            zoom(ZOOM_RATE.powf(-dy));
-            glib::Propagation::Stop
-        });
-    }
-    scroller.add_controller(scroll);
-
-    // ---- native drag-out (the critical capability) ----------------
-    let drag = DragSource::new();
-    drag.set_actions(gdk::DragAction::COPY);
-    {
-        let cur_path = cur_path.clone();
-        drag.connect_prepare(move |_src, _x, _y| {
-            let path = cur_path.borrow().clone();
-            if path.as_os_str().is_empty() {
-                return None;
-            }
-            let file = gio::File::for_path(&path);
-            // Offer both a GFile value and a text/uri-list payload so GNOME
-            // (Nautilus) and KDE (Dolphin) both accept the drop as a copy.
-            let uri = format!("{}\r\n", file.uri());
-            let uri_provider =
-                gdk::ContentProvider::for_bytes("text/uri-list", &glib::Bytes::from_owned(uri.into_bytes()));
-            let file_provider = gdk::ContentProvider::for_value(&file.to_value());
-            Some(gdk::ContentProvider::new_union(&[file_provider, uri_provider]))
-        });
-    }
-    {
-        // Small thumbnail as the drag cursor icon (not the full-res image).
-        let cur_path = cur_path.clone();
-        drag.connect_drag_begin(move |src, _drag| {
-            let path = cur_path.borrow().clone();
-            if let Ok(pb) = gdk_pixbuf::Pixbuf::from_file_at_scale(&path, 160, 160, true) {
-                let tex = gdk::Texture::for_pixbuf(&pb);
-                src.set_icon(Some(&tex), tex.width() / 2, tex.height() / 2);
-            }
-        });
-    }
-    picture.add_controller(drag);
-
-    refresh();
-    window.present();
-
-    // The viewport has no size yet at build time; fit once it's been allocated.
-    {
-        let fit = fit.clone();
-        glib::timeout_add_local_once(Duration::from_millis(30), move || fit());
-    }
+    let sort = cli.sort.clone().map(|k| (k, cli.sort_desc));
+    App::new(gtkapp, session, sort);
 }
