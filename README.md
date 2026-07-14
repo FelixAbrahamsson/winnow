@@ -23,15 +23,34 @@ image viewer and mash Delete".
 
 ## Install
 
+**Prebuilt binary (no Python needed):**
+
 ```bash
-uv venv --python 3.10
-uv pip install -e .
+curl -fsSL https://raw.githubusercontent.com/FelixAbrahamsson/winnow/master/install.sh | sh
+```
+
+Downloads the latest Linux release into `~/.local/bin/winnow` and registers the
+"Open With → Winnow" launcher.
+
+**From source (needs [uv](https://docs.astral.sh/uv/)):**
+
+```bash
+uv tool install git+https://github.com/FelixAbrahamsson/winnow
+winnow --install-desktop      # optional: register the Open With launcher
 ```
 
 On X11 sessions, Qt 6.5+ needs one system library (a one-time install):
 
 ```bash
 sudo apt-get install -y libxcb-cursor0
+```
+
+### Development
+
+```bash
+uv venv --python 3.10
+uv pip install -e .
+uv run winnow /path/to/images
 ```
 
 ## Run
@@ -46,18 +65,17 @@ uv run winnow /path/to/images/img_0007.jpg    # open a single image (starts on i
 
 ## Right-click "Open With" integration
 
-Register a desktop launcher so you can right-click a folder **or** an image in
-your file manager and pick *Open With → Winnow* (it also appears in the app
-menu):
+The `install.sh` binary installer registers this automatically. Otherwise run:
 
 ```bash
-./scripts/install-desktop.sh
+winnow --install-desktop        # or, in a dev checkout: ./scripts/install-desktop.sh
 ```
 
-Opening a folder loads all its images; opening a single image loads its folder
-and starts on that image. Re-run the script after moving the project folder
-(the launcher stores an absolute path to the venv). To remove it, delete
-`~/.local/share/applications/winnow.desktop`.
+Then right-click a folder **or** an image in your file manager and pick
+*Open With → Winnow* (it also appears in the app menu). Opening a folder loads
+all its images; opening a single image loads its folder and starts on that
+image. Re-run it if you move the install (the launcher stores an absolute
+path). To remove it, delete `~/.local/share/applications/winnow.desktop`.
 
 ## Moving or renaming the project folder
 
@@ -70,6 +88,17 @@ rm -rf .venv && uv venv && uv pip install -e .   # recreate the venv
 ```
 
 Git is unaffected (its history lives inside the folder and moves with it).
+
+## Releasing (maintainer)
+
+Push a version tag; a GitHub Action builds the Linux binary and attaches it to
+a Release, which `install.sh` then downloads:
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+To build the binary locally: `uv pip install -e ".[build]" && pyinstaller packaging/winnow.spec --noconfirm` (output in `dist/winnow/`).
 
 ## Keybindings
 

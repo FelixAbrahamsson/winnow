@@ -1,0 +1,44 @@
+name: release
+
+# Build a Linux binary and attach it to a GitHub Release whenever a version
+# tag (e.g. v0.1.0) is pushed:
+#
+#     git tag v0.1.0 && git push origin v0.1.0
+#
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x86_64:
+    # Build on the oldest supported runner for the widest glibc compatibility.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt/X11 runtime libs (needed to bundle the xcb plugin)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-cursor0 libxcb-xinerama0 libegl1
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Build binary
+        run: |
+          uv venv --python 3.11
+          uv pip install -e ".[build]"
+          uv run pyinstaller packaging/winnow.spec --noconfirm
+          tar -C dist -czf winnow-linux-x86_64.tar.gz winnow
+          sha256sum winnow-linux-x86_64.tar.gz | tee winnow-linux-x86_64.tar.gz.sha256
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            winnow-linux-x86_64.tar.gz
+            winnow-linux-x86_64.tar.gz.sha256
+          generate_release_notes: true

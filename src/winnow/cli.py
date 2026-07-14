@@ -46,11 +46,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--buckets", metavar="FILE", help="bucket config TOML (default: .winnow.toml in folder)")
     p.add_argument("--sort", metavar="KEY", help="initial sort key (e.g. name, mtime, size, meta:COLUMN)")
     p.add_argument("--sort-desc", action="store_true", help="sort descending")
+    p.add_argument(
+        "--install-desktop",
+        action="store_true",
+        help="register the 'Open With -> Winnow' launcher and exit",
+    )
     return p
 
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+
+    if args.install_desktop:
+        from .desktop import install_desktop
+
+        path = install_desktop()
+        print(f"Installed launcher: {path}")
+        print("Right-click a folder or image -> Open With -> Winnow.")
+        return 0
 
     target = Path(args.folder).expanduser().resolve()
     # Accept either a folder or a single image file (opens its folder, and
