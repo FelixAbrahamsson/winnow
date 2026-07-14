@@ -12,6 +12,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gtk4::gdk;
+use gtk4::gdk_pixbuf;
 use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
@@ -259,10 +260,13 @@ fn build_ui(app: &Application) {
         });
     }
     {
-        let picture = picture.clone();
+        // Small thumbnail as the drag cursor icon (not the full-res image).
+        let cur_path = cur_path.clone();
         drag.connect_drag_begin(move |src, _drag| {
-            if let Some(p) = picture.paintable() {
-                src.set_icon(Some(&p), 0, 0);
+            let path = cur_path.borrow().clone();
+            if let Ok(pb) = gdk_pixbuf::Pixbuf::from_file_at_scale(&path, 160, 160, true) {
+                let tex = gdk::Texture::for_pixbuf(&pb);
+                src.set_icon(Some(&tex), tex.width() / 2, tex.height() / 2);
             }
         });
     }
