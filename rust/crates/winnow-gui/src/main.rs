@@ -9,6 +9,7 @@
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Duration;
 
 use gtk4::gdk;
 use gtk4::gio;
@@ -16,13 +17,15 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, DragSource, EventControllerKey, EventControllerScroll,
-    EventControllerScrollFlags, Picture, ScrolledWindow,
+    EventControllerScrollFlags, Picture, PropagationPhase, ScrolledWindow,
 };
 use winnow_core::Session;
 
 const APP_ID: &str = "com.github.felixabrahamsson.winnow";
-const MIN_SCALE: f64 = 0.05;
+const MIN_SCALE: f64 = 0.05; // absolute floor used only before the view is sized
 const MAX_SCALE: f64 = 40.0;
+const ZOOM_RATE: f64 = 1.1; // per unit of scroll delta (proportional to magnitude)
+const KEY_ZOOM_STEP: f64 = 1.25; // per +/- keypress
 
 fn main() -> glib::ExitCode {
     let app = Application::builder().application_id(APP_ID).build();
@@ -63,6 +66,7 @@ fn build_ui(app: &Application) {
 
     let session = Rc::new(RefCell::new(session));
     let scale = Rc::new(Cell::new(1.0f64));
+    let fitted = Rc::new(Cell::new(true)); // auto-fit until the user manually zooms
     let cur_path = Rc::new(RefCell::new(PathBuf::new()));
 
     let picture = Picture::new();
@@ -71,11 +75,8 @@ fn build_ui(app: &Application) {
     picture.set_halign(gtk4::Align::Center);
     picture.set_valign(gtk4::Align::Center);
 
-    let scroller = ScrolledWindow::builder()
-        .hexpand(true)
-        .vexpand(true)
-        .child(&picture)
-        .build();
+    let scroller = ScrolledWindow::builder().hexpand(true).vexpand(true).child(&picture).build();
+    scroller.set_kinetic_scrolling(false);
 
     let window = ApplicationWindow::builder()
         .application(app)
@@ -85,13 +86,83 @@ fn build_ui(app: &Application) {
         .child(&scroller)
         .build();
 
-    // ---- refresh helpers ------------------------------------------
-    let refresh = {
+    // Scale at which the image exactly fits the current viewport (None until
+    // the view has been allocated a size).
+    let viewport_fit: Rc<dyn Fn() -> Option<f64>> = {
+        let picture = picture.clone();
+        let scroller = scroller.clone();
+        Rc::new(move || {
+            let p = picture.paintable()?;
+            let (iw, ih) = (p.intrinsic_width() as f64, p.intrinsic_height() as f64);
+            let (vw, vh) = (scroller.width() as f64, scroller.height() as f64);
+            if iw > 0.0 && ih > 0.0 && vw > 0.0 && vh > 0.0 {
+                Some((vw / iw).min(vh / ih))
+            } else {
+                None
+            }
+        })
+    };
+
+    // Smallest allowed zoom: fit-to-window, but never forcing upscaling of a
+    // small image beyond 100%.
+    let min_scale: Rc<dyn Fn() -> f64> = {
+        let viewport_fit = viewport_fit.clone();
+        Rc::new(move || viewport_fit().map(|f| f.min(1.0)).unwrap_or(MIN_SCALE))
+    };
+
+    let apply_scale: Rc<dyn Fn()> = {
+        let picture = picture.clone();
+        let scale = scale.clone();
+        Rc::new(move || {
+            if let Some(p) = picture.paintable() {
+                let sc = scale.get();
+                picture.set_size_request(
+                    (p.intrinsic_width() as f64 * sc).round() as i32,
+                    (p.intrinsic_height() as f64 * sc).round() as i32,
+                );
+            }
+        })
+    };
+
+    // Manual zoom by a relative factor, clamped to [fit, MAX]. Stops auto-fit.
+    let zoom: Rc<dyn Fn(f64)> = {
+        let scale = scale.clone();
+        let apply_scale = apply_scale.clone();
+        let min_scale = min_scale.clone();
+        let fitted = fitted.clone();
+        Rc::new(move |factor: f64| {
+            let s = (scale.get() * factor).clamp(min_scale(), MAX_SCALE);
+            scale.set(s);
+            fitted.set(false);
+            apply_scale();
+        })
+    };
+
+    // Fit the current image to the window (and re-enable auto-fit).
+    let fit: Rc<dyn Fn()> = {
+        let scale = scale.clone();
+        let apply_scale = apply_scale.clone();
+        let viewport_fit = viewport_fit.clone();
+        let fitted = fitted.clone();
+        Rc::new(move || {
+            if let Some(f) = viewport_fit() {
+                scale.set(f.min(1.0));
+                apply_scale();
+            }
+            fitted.set(true);
+        })
+    };
+
+    // Load and show the current image.
+    let refresh: Rc<dyn Fn()> = {
         let session = session.clone();
         let scale = scale.clone();
+        let fitted = fitted.clone();
         let cur_path = cur_path.clone();
         let picture = picture.clone();
         let window = window.clone();
+        let apply_scale = apply_scale.clone();
+        let viewport_fit = viewport_fit.clone();
         Rc::new(move || {
             let s = session.borrow();
             if let Some(item) = s.current() {
@@ -99,11 +170,12 @@ fn build_ui(app: &Application) {
                 match gdk::Texture::from_filename(&item.abs_path) {
                     Ok(tex) => {
                         picture.set_paintable(Some(&tex));
-                        let sc = scale.get();
-                        picture.set_size_request(
-                            (tex.width() as f64 * sc) as i32,
-                            (tex.height() as f64 * sc) as i32,
-                        );
+                        if fitted.get() {
+                            if let Some(f) = viewport_fit() {
+                                scale.set(f.min(1.0));
+                            }
+                        }
+                        apply_scale();
                     }
                     Err(_) => picture.set_paintable(None::<&gdk::Texture>),
                 }
@@ -115,27 +187,17 @@ fn build_ui(app: &Application) {
         })
     };
 
-    let apply_scale = {
-        let picture = picture.clone();
-        let scale = scale.clone();
-        Rc::new(move || {
-            if let Some(p) = picture.paintable() {
-                let sc = scale.get();
-                picture.set_size_request(
-                    (p.intrinsic_width() as f64 * sc) as i32,
-                    (p.intrinsic_height() as f64 * sc) as i32,
-                );
-            }
-        })
-    };
-
-    // ---- keyboard navigation & zoom -------------------------------
+    // ---- keyboard: navigation & zoom ------------------------------
     let keys = EventControllerKey::new();
     {
         let session = session.clone();
-        let scale = scale.clone();
         let refresh = refresh.clone();
+        let zoom = zoom.clone();
+        let fit = fit.clone();
+        let scale = scale.clone();
         let apply_scale = apply_scale.clone();
+        let fitted = fitted.clone();
+        let min_scale = min_scale.clone();
         keys.connect_key_pressed(move |_c, keyval, _code, _mods| {
             match keyval {
                 gdk::Key::Right | gdk::Key::space => {
@@ -146,16 +208,12 @@ fn build_ui(app: &Application) {
                     session.borrow_mut().prev();
                     refresh();
                 }
-                gdk::Key::plus | gdk::Key::equal => {
-                    scale.set((scale.get() * 1.25).min(MAX_SCALE));
-                    apply_scale();
-                }
-                gdk::Key::minus => {
-                    scale.set((scale.get() / 1.25).max(MIN_SCALE));
-                    apply_scale();
-                }
+                gdk::Key::plus | gdk::Key::equal => zoom(KEY_ZOOM_STEP),
+                gdk::Key::minus => zoom(1.0 / KEY_ZOOM_STEP),
+                gdk::Key::f => fit(),
                 gdk::Key::_1 => {
-                    scale.set(1.0);
+                    scale.set(1.0f64.clamp(min_scale(), MAX_SCALE));
+                    fitted.set(false);
                     apply_scale();
                 }
                 _ => return glib::Propagation::Proceed,
@@ -165,19 +223,20 @@ fn build_ui(app: &Application) {
     }
     window.add_controller(keys);
 
-    // ---- scroll-to-zoom -------------------------------------------
+    // ---- scroll-to-zoom (proportional to delta; works anywhere) ---
+    // Capture phase + Stop so it fires before the ScrolledWindow pans.
     let scroll = EventControllerScroll::new(EventControllerScrollFlags::VERTICAL);
+    scroll.set_propagation_phase(PropagationPhase::Capture);
     {
-        let scale = scale.clone();
-        let apply_scale = apply_scale.clone();
+        let zoom = zoom.clone();
         scroll.connect_scroll(move |_c, _dx, dy| {
-            let factor = if dy < 0.0 { 1.15 } else { 1.0 / 1.15 };
-            scale.set((scale.get() * factor).clamp(MIN_SCALE, MAX_SCALE));
-            apply_scale();
+            // dy>0 = scroll down = zoom out. Proportional to magnitude, so a
+            // trackpad's many small deltas don't slam to the limit.
+            zoom(ZOOM_RATE.powf(-dy));
             glib::Propagation::Stop
         });
     }
-    picture.add_controller(scroll);
+    scroller.add_controller(scroll);
 
     // ---- native drag-out (the critical capability) ----------------
     let drag = DragSource::new();
@@ -200,7 +259,6 @@ fn build_ui(app: &Application) {
         });
     }
     {
-        // Use the current image as the drag cursor icon.
         let picture = picture.clone();
         drag.connect_drag_begin(move |src, _drag| {
             if let Some(p) = picture.paintable() {
@@ -212,4 +270,10 @@ fn build_ui(app: &Application) {
 
     refresh();
     window.present();
+
+    // The viewport has no size yet at build time; fit once it's been allocated.
+    {
+        let fit = fit.clone();
+        glib::timeout_add_local_once(Duration::from_millis(30), move || fit());
+    }
 }
