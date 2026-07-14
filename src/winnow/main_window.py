@@ -297,10 +297,11 @@ class MainWindow(QMainWindow):
             return
         url = QUrl.fromLocalFile(str(item.abs_path))
         mime = QMimeData()
-        mime.setUrls([url])
+        mime.setUrls([url])  # text/uri-list: understood by Dolphin, Nautilus, etc.
         mime.setText(str(item.abs_path))
-        # GNOME Files / Nautilus paste needs this specific format.
-        mime.setData("x-special/gnome-copied-files", b"copy\n" + url.toEncoded())
+        # Desktop-specific "paste = copy (not move)" hints:
+        mime.setData("x-special/gnome-copied-files", b"copy\n" + url.toEncoded())  # GNOME/Nautilus
+        mime.setData("application/x-kde-cutselection", b"0")  # KDE/Dolphin (0=copy, 1=cut)
         QGuiApplication.clipboard().setMimeData(mime)
         self._flash(f"Copied file (paste into a file manager): {item.name}", 4000)
 
