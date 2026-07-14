@@ -52,7 +52,15 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
 
-    root = Path(args.folder).expanduser().resolve()
+    target = Path(args.folder).expanduser().resolve()
+    # Accept either a folder or a single image file (opens its folder, and
+    # starts on that image) so "Open with winnow" works for both.
+    start_file: Path | None = None
+    if target.is_file():
+        start_file = target
+        root = target.parent
+    else:
+        root = target
     if not root.is_dir():
         print(f"error: not a directory: {root}", file=sys.stderr)
         return 2
@@ -90,6 +98,11 @@ def main(argv=None) -> int:
     win = launch_window(session)
     if args.sort:
         session.apply_sort(args.sort, args.sort_desc)
+    if start_file is not None:
+        for i, item in enumerate(session.items):
+            if item.abs_path == start_file:
+                session.set_index(i)
+                break
     return app.exec()
 
 

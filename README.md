@@ -41,7 +41,35 @@ uv run winnow /path/to/images                 # recurse into subfolders by defau
 uv run winnow /path/to/images --no-recursive  # top-level folder only
 uv run winnow /path/to/images --metadata metadata.csv
 uv run winnow /path/to/images --sort meta:severity --sort-desc
+uv run winnow /path/to/images/img_0007.jpg    # open a single image (starts on it)
 ```
+
+## Right-click "Open With" integration
+
+Register a desktop launcher so you can right-click a folder **or** an image in
+your file manager and pick *Open With → Winnow* (it also appears in the app
+menu):
+
+```bash
+./scripts/install-desktop.sh
+```
+
+Opening a folder loads all its images; opening a single image loads its folder
+and starts on that image. Re-run the script after moving the project folder
+(the launcher stores an absolute path to the venv). To remove it, delete
+`~/.local/share/applications/winnow.desktop`.
+
+## Moving or renaming the project folder
+
+The `.venv` and the desktop launcher store **absolute paths**, so after moving
+or renaming this folder:
+
+```bash
+rm -rf .venv && uv venv && uv pip install -e .   # recreate the venv
+./scripts/install-desktop.sh                     # fix the launcher's path
+```
+
+Git is unaffected (its history lives inside the folder and moves with it).
 
 ## Keybindings
 

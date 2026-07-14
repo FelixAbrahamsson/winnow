@@ -93,7 +93,10 @@ class _ThumbTask(QRunnable):
     def run(self):
         img = load_thumbnail(self.path, self.mtime, self.size, self.thumb)
         if img is not None:
-            self.signals.thumbReady.emit(self.rel, img, self.gen)
+            try:
+                self.signals.thumbReady.emit(self.rel, img, self.gen)
+            except RuntimeError:
+                pass  # receiver torn down (app shutting down)
 
 
 class _FullTask(QRunnable):
@@ -104,7 +107,10 @@ class _FullTask(QRunnable):
     def run(self):
         img = load_full(self.path)
         if img is not None:
-            self.signals.fullReady.emit(self.rel, img, self.gen)
+            try:
+                self.signals.fullReady.emit(self.rel, img, self.gen)
+            except RuntimeError:
+                pass  # receiver torn down (app shutting down)
 
 
 class Loader(QObject):
