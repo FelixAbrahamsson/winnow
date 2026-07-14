@@ -35,6 +35,7 @@ from .grid_view import GridView
 from .loader import Loader
 from .model import Session
 from .single_view import SingleView
+from .textutil import linkify
 
 FULL_CACHE_CAP = 7
 
@@ -104,9 +105,17 @@ class InfoPanel(QWidget):
         meta = self.session.metadata.get(item.rel_path)
         self.meta_header.setVisible(bool(self.session.metadata))
         for k, val in meta.items():
-            v = QLabel(str(val))
+            v = QLabel()
             v.setWordWrap(True)
-            v.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            html, has_link = linkify(str(val))
+            if has_link:
+                v.setTextFormat(Qt.RichText)
+                v.setText(html)
+                v.setOpenExternalLinks(True)
+                v.setTextInteractionFlags(Qt.TextBrowserInteraction)
+            else:
+                v.setText(str(val))
+                v.setTextInteractionFlags(Qt.TextSelectableByMouse)
             self.meta_form.addRow(QLabel(k + ":"), v)
 
 
