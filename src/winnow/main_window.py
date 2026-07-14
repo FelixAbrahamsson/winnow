@@ -6,7 +6,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QMimeData, Qt, QUrl
+from PySide6.QtCore import QEvent, QMimeData, Qt, QTimer, QUrl
 from PySide6.QtGui import QGuiApplication, QImage, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -147,18 +147,26 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.RightDockWidgetArea, dock)
         self.info_dock = dock
 
-        # status bar labels
+        # status bar labels. NOTE: QStatusBar.showMessage() hides all non-
+        # permanent widgets (it would blank the counter/filename), so transient
+        # notices go through self._flash() into a dedicated label instead.
         self.lbl_counter = QLabel("0/0")
         self.lbl_name = QLabel("")
+        self.lbl_msg = QLabel("")
+        self.lbl_msg.setStyleSheet("color:#8ab4f8;")
         self.lbl_zoom = QLabel("")
         self.lbl_bright = QLabel("")
         self.lbl_mode = QLabel("single")
         sb = self.statusBar()
         sb.addWidget(self.lbl_counter)
         sb.addWidget(self.lbl_name, 1)
+        sb.addWidget(self.lbl_msg)
         sb.addPermanentWidget(self.lbl_bright)
         sb.addPermanentWidget(self.lbl_zoom)
         sb.addPermanentWidget(self.lbl_mode)
+        self._msg_timer = QTimer(self)
+        self._msg_timer.setSingleShot(True)
+        self._msg_timer.timeout.connect(lambda: self.lbl_msg.setText(""))
 
         # right-click context menu on both views (they emit a global position)
         self.single.contextRequested.connect(self._show_context_menu)
@@ -175,7 +183,7 @@ class MainWindow(QMainWindow):
     def _wire_signals(self):
         self.session.currentChanged.connect(self._on_current_changed)
         self.session.listChanged.connect(self._on_list_changed)
-        self.session.statusMessage.connect(lambda m: self.statusBar().showMessage(m, 4000))
+        self.session.statusMessage.connect(self._flash)
         self.loader.fullReady.connect(self._on_full_ready)
         self.single.zoomChanged.connect(self._on_zoom_changed)
         self.single.doubleClicked.connect(self._toggle_fullscreen)
@@ -183,6 +191,11 @@ class MainWindow(QMainWindow):
         self.grid.selectionModel().currentChanged.connect(self._on_grid_current)
         self.info.sort_combo.currentIndexChanged.connect(self._apply_sort)
         self.info.desc_check.toggled.connect(self._apply_sort)
+
+    def _flash(self, text: str, msec: int = 4000):
+        """Show a transient status notice without hiding the counter/filename."""
+        self.lbl_msg.setText(text)
+        self._msg_timer.start(msec)
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.MouseButtonPress:
@@ -268,13 +281,13 @@ class MainWindow(QMainWindow):
         item = self.session.current()
         if item:
             QGuiApplication.clipboard().setText(item.name)
-            self.statusBar().showMessage(f"Copied filename: {item.name}", 3000)
+            self._flash(f"Copied filename: {item.name}", 3000)
 
     def _copy_path(self):
         item = self.session.current()
         if item:
             QGuiApplication.clipboard().setText(str(item.abs_path))
-            self.statusBar().showMessage(f"Copied path: {item.abs_path}", 3000)
+            self._flash(f"Copied path: {item.abs_path}", 3000)
 
     def _copy_file(self):
         """Put the image file on the clipboard so it can be pasted into a file
@@ -289,7 +302,7 @@ class MainWindow(QMainWindow):
         # GNOME Files / Nautilus paste needs this specific format.
         mime.setData("x-special/gnome-copied-files", b"copy\n" + url.toEncoded())
         QGuiApplication.clipboard().setMimeData(mime)
-        self.statusBar().showMessage(f"Copied file (paste into a file manager): {item.name}", 4000)
+        self._flash(f"Copied file (paste into a file manager): {item.name}", 4000)
 
     def _bump_brightness(self, delta: float):
         val = self.single.bump_brightness(delta)
