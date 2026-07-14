@@ -1,0 +1,39 @@
+name: rust-ci
+
+on:
+  push:
+    branches: [master, rust-rewrite]
+    paths: ["rust/**", ".github/workflows/rust-ci.yml"]
+  pull_request:
+    paths: ["rust/**", ".github/workflows/rust-ci.yml"]
+
+jobs:
+  build-test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GTK4 dev libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Build workspace
+        working-directory: rust
+        run: cargo build --workspace --locked
+
+      - name: Test winnow-core
+        working-directory: rust
+        run: cargo test -p winnow-core --locked
+
+      - name: Clippy (core)
+        working-directory: rust
+        run: cargo clippy -p winnow-core --locked -- -D warnings

@@ -1,10 +1,12 @@
 name: release
 
-# Build a Linux binary and attach it to a GitHub Release whenever a version
-# tag (e.g. v0.1.0) is pushed:
+# Build the Rust/GTK4 binary and attach it to a GitHub Release whenever a
+# version tag (e.g. v0.2.0) is pushed:
 #
-#     git tag v0.1.0 && git push origin v0.1.0
+#     git tag v0.2.0 && git push origin v0.2.0
 #
+# The binary is dynamically linked against the system GTK4 (~1-2 MB); users
+# need the GTK4 runtime installed (see install.sh).
 on:
   push:
     tags: ["v*"]
@@ -15,24 +17,30 @@ permissions:
 
 jobs:
   linux-x86_64:
-    # Build on the oldest supported runner for the widest glibc compatibility.
+    # Build on the oldest supported runner for the widest glibc/GTK compatibility.
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Qt/X11 runtime libs (needed to bundle the xcb plugin)
+      - name: Install GTK4 dev libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxcb-cursor0 libxcb-xinerama0 libegl1
+          sudo apt-get install -y libgtk-4-dev
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build binary
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Build release binary
+        working-directory: rust
+        run: cargo build --release -p winnow-gui --locked
+
+      - name: Package
         run: |
-          uv venv --python 3.11
-          uv pip install -e ".[build]"
-          uv run pyinstaller packaging/winnow.spec --noconfirm
-          tar -C dist -czf winnow-linux-x86_64.tar.gz winnow
+          install -m755 rust/target/release/winnow winnow
+          tar -czf winnow-linux-x86_64.tar.gz winnow
           sha256sum winnow-linux-x86_64.tar.gz | tee winnow-linux-x86_64.tar.gz.sha256
 
       - name: Publish release

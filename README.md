@@ -4,8 +4,13 @@ A fast, keyboard-driven image culling / selection tool for ML data curation —
 built for stepping through folders of images, inspecting them closely, and
 sorting them into keep / reject (and optional category) buckets.
 
-Native Linux app (PySide6 / Qt6). Purpose-built to replace "open the GNOME
+Native Linux app (Rust / GTK4). Purpose-built to replace "open the GNOME
 image viewer and mash Delete".
+
+> **Note:** winnow was rewritten from Python/PySide6 to Rust/GTK4 for a tiny
+> (~1 MB vs ~90 MB) native binary. The workspace lives in `rust/`
+> (`winnow-core` = pure logic + tests, `winnow-gui` = the GTK front-end). The
+> original Python implementation remains in `src/winnow/` for reference.
 
 ## Why this instead of the built-in viewer
 
@@ -18,50 +23,54 @@ image viewer and mash Delete".
   contact-sheet grid for fast bulk culling. Toggle with `G`.
 - **Metadata.** Point it at a `metadata.csv` and see per-image columns in the
   side panel — and sort the whole set on any column.
-- **Scales to thousands** of images with lazy thumbnails, an on-disk thumbnail
-  cache, and full-image prefetch.
+- **Scales to thousands** of images: the grid is virtualized (only visible
+  thumbnails are decoded) and thumbnails are cached in memory.
 
 ## Install
 
-**Prebuilt binary (no Python needed):**
+**Prebuilt binary (~630 KB download):**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/FelixAbrahamsson/winnow/master/install.sh | sh
 ```
 
 Downloads the latest Linux release into `~/.local/bin/winnow` and registers the
-"Open With → Winnow" launcher.
-
-**From source (needs [uv](https://docs.astral.sh/uv/)):**
+"Open With → Winnow" launcher. The binary is dynamically linked against the
+system **GTK4 runtime**, which is present on GNOME/KDE and otherwise a one-line
+install:
 
 ```bash
-uv tool install git+https://github.com/FelixAbrahamsson/winnow
-winnow --install-desktop      # optional: register the Open With launcher
+sudo apt-get install -y libgtk-4-1   # Debian/Ubuntu/Pop!_OS  (Fedora: gtk4, Arch: gtk4)
 ```
 
-On X11 sessions, Qt 6.5+ needs one system library (a one-time install):
+**From source (needs the [Rust toolchain](https://rustup.rs) + GTK4 dev headers):**
 
 ```bash
-sudo apt-get install -y libxcb-cursor0
+sudo apt-get install -y libgtk-4-dev
+cargo install --git https://github.com/FelixAbrahamsson/winnow winnow-gui
+winnow --install-desktop      # optional: register the Open With launcher
 ```
 
 ### Development
 
 ```bash
-uv venv --python 3.10
-uv pip install -e .
-uv run winnow /path/to/images
+sudo apt-get install -y libgtk-4-dev
+cd rust
+cargo test -p winnow-core          # pure-logic unit tests
+cargo run -p winnow-gui -- /path/to/images
 ```
 
 ## Run
 
 ```bash
-uv run winnow /path/to/images                 # recurse into subfolders by default
-uv run winnow /path/to/images --no-recursive  # top-level folder only
-uv run winnow /path/to/images --metadata metadata.csv
-uv run winnow /path/to/images --sort meta:severity --sort-desc
-uv run winnow /path/to/images/img_0007.jpg    # open a single image (starts on it)
+winnow /path/to/images                 # recurse into subfolders by default
+winnow /path/to/images --no-recursive  # top-level folder only
+winnow /path/to/images --metadata metadata.csv
+winnow /path/to/images --sort meta:severity --sort-desc
+winnow /path/to/images/img_0007.jpg    # open a single image (starts on it)
 ```
+
+(In a dev checkout, prefix with `cargo run -p winnow-gui --` from `rust/`.)
 
 ## Right-click "Open With" integration
 
@@ -77,17 +86,10 @@ all its images; opening a single image loads its folder and starts on that
 image. Re-run it if you move the install (the launcher stores an absolute
 path). To remove it, delete `~/.local/share/applications/winnow.desktop`.
 
-## Moving or renaming the project folder
+## Moving or renaming the install
 
-The `.venv` and the desktop launcher store **absolute paths**, so after moving
-or renaming this folder:
-
-```bash
-rm -rf .venv && uv venv && uv pip install -e .   # recreate the venv
-./scripts/install-desktop.sh                     # fix the launcher's path
-```
-
-Git is unaffected (its history lives inside the folder and moves with it).
+The desktop launcher stores an **absolute path** to the `winnow` binary, so if
+you move it, re-run `winnow --install-desktop` to fix the launcher.
 
 ## Releasing (maintainer)
 
@@ -95,10 +97,11 @@ Push a version tag; a GitHub Action builds the Linux binary and attaches it to
 a Release, which `install.sh` then downloads:
 
 ```bash
-git tag v0.1.0 && git push origin v0.1.0
+git tag v0.2.0 && git push origin v0.2.0
 ```
 
-To build the binary locally: `uv pip install -e ".[build]" && pyinstaller packaging/winnow.spec --noconfirm` (output in `dist/winnow/`).
+To build the binary locally: `cd rust && cargo build --release -p winnow-gui`
+(output at `rust/target/release/winnow`, ~1 MB).
 
 ## Keybindings
 
