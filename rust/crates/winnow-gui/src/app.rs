@@ -71,6 +71,11 @@ pub struct App {
     picture: Picture,
     scroller: ScrolledWindow,
     status: Label,
+    info_panel: gtk4::Box,
+    info_rows: gtk4::Box,
+    sort_keys: Vec<(String, String)>,
+    sort_dropdown: gtk4::DropDown,
+    desc_check: gtk4::CheckButton,
     orig_pixbuf: RefCell<Option<Pixbuf>>,
     cur_path: RefCell<PathBuf>,
     scale: Cell<f64>,
@@ -84,6 +89,60 @@ pub struct App {
 
 fn event_has_ctrl(ev: Option<gdk::Event>) -> bool {
     ev.map(|e| e.modifier_state().contains(gdk::ModifierType::CONTROL_MASK)).unwrap_or(false)
+}
+
+fn human_size(n: u64) -> String {
+    let mut f = n as f64;
+    for unit in ["B", "KB", "MB", "GB"] {
+        if f < 1024.0 || unit == "GB" {
+            return if unit == "B" { format!("{n} B") } else { format!("{f:.1} {unit}") };
+        }
+        f /= 1024.0;
+    }
+    format!("{n} B")
+}
+
+fn format_mtime(secs: f64) -> Option<String> {
+    if secs <= 0.0 {
+        return None;
+    }
+    glib::DateTime::from_unix_local(secs as i64)
+        .ok()
+        .and_then(|dt| dt.format("%Y-%m-%d %H:%M").ok())
+        .map(|g| g.to_string())
+}
+
+fn is_url(t: &str) -> bool {
+    ["http://", "https://", "ftp://", "file://", "www."].iter().any(|p| t.starts_with(p))
+}
+
+/// Wrap URLs in Pango `<a href>` markup, escaping the rest. Returns (markup, found).
+fn linkify_markup(text: &str) -> (String, bool) {
+    let mut found = false;
+    let parts: Vec<String> = text
+        .split(' ')
+        .map(|tok| {
+            let trimmed = tok.trim_end_matches(|c: char| ".,;:!?)]}>\"'".contains(c));
+            let trail = &tok[trimmed.len()..];
+            if !trimmed.is_empty() && is_url(trimmed) {
+                found = true;
+                let href = if trimmed.contains("://") {
+                    trimmed.to_string()
+                } else {
+                    format!("https://{trimmed}")
+                };
+                format!(
+                    "<a href=\"{}\">{}</a>{}",
+                    glib::markup_escape_text(&href),
+                    glib::markup_escape_text(trimmed),
+                    glib::markup_escape_text(trail)
+                )
+            } else {
+                glib::markup_escape_text(tok).to_string()
+            }
+        })
+        .collect();
+    (parts.join(" "), found)
 }
 
 #[derive(Clone, Copy)]
@@ -125,12 +184,44 @@ impl App {
         vbox.append(&scroller);
         vbox.append(&status);
 
+        // ---- info / sort side panel ----
+        let sort_keys: Vec<(String, String)> = session.sortable_keys();
+        let labels: Vec<&str> = sort_keys.iter().map(|(_, l)| l.as_str()).collect();
+        let sort_dropdown = gtk4::DropDown::from_strings(&labels);
+        let desc_check = gtk4::CheckButton::with_label("desc");
+        let sort_row = gtk4::Box::new(Orientation::Horizontal, 6);
+        sort_row.set_margin_top(8);
+        sort_row.set_margin_bottom(4);
+        sort_row.set_margin_start(8);
+        sort_row.set_margin_end(8);
+        sort_row.append(&Label::new(Some("Sort:")));
+        sort_dropdown.set_hexpand(true);
+        sort_row.append(&sort_dropdown);
+        sort_row.append(&desc_check);
+
+        let info_rows = gtk4::Box::new(Orientation::Vertical, 2);
+        info_rows.set_margin_start(8);
+        info_rows.set_margin_end(8);
+        let info_scroll =
+            ScrolledWindow::builder().hexpand(true).vexpand(true).child(&info_rows).build();
+
+        let info_panel = gtk4::Box::new(Orientation::Vertical, 0);
+        info_panel.set_width_request(280);
+        info_panel.append(&sort_row);
+        info_panel.append(&gtk4::Separator::new(Orientation::Horizontal));
+        info_panel.append(&info_scroll);
+
+        let hbox = gtk4::Box::new(Orientation::Horizontal, 0);
+        hbox.append(&vbox);
+        hbox.append(&gtk4::Separator::new(Orientation::Vertical));
+        hbox.append(&info_panel);
+
         let window = ApplicationWindow::builder()
             .application(gtkapp)
             .title("winnow")
-            .default_width(1200)
-            .default_height(800)
-            .child(&vbox)
+            .default_width(1280)
+            .default_height(820)
+            .child(&hbox)
             .build();
 
         let app = Rc::new(App {
@@ -139,6 +230,11 @@ impl App {
             picture,
             scroller,
             status,
+            info_panel,
+            info_rows,
+            sort_keys,
+            sort_dropdown,
+            desc_check,
             orig_pixbuf: RefCell::new(None),
             cur_path: RefCell::new(PathBuf::new()),
             scale: Cell::new(1.0),
@@ -153,8 +249,12 @@ impl App {
         app.build_controllers();
         app.refresh();
         if let Some((key, desc)) = sort {
-            app.session.borrow_mut().apply_sort(&key, desc);
-            app.refresh();
+            // Setting the widgets fires the handlers, which apply the sort.
+            app.desc_check.set_active(desc);
+            if let Some(pos) = app.sort_keys.iter().position(|(k, _)| k == &key) {
+                app.sort_dropdown.set_selected(pos as u32);
+            }
+            app.apply_sort_from_ui();
         }
         app.window.present();
 
@@ -196,6 +296,7 @@ impl App {
             }
         }
         self.update_status();
+        self.update_info();
     }
 
     /// Re-apply brightness/gamma to the current image (keeps zoom).
@@ -496,6 +597,101 @@ impl App {
         self.build_mouse();
         self.build_drag_source();
         self.build_context_menu();
+        self.build_info_controls();
+    }
+
+    fn build_info_controls(self: &Rc<Self>) {
+        {
+            let app = self.clone();
+            self.sort_dropdown.connect_selected_notify(move |_| app.apply_sort_from_ui());
+        }
+        {
+            let app = self.clone();
+            self.desc_check.connect_toggled(move |_| app.apply_sort_from_ui());
+        }
+    }
+
+    fn apply_sort_from_ui(self: &Rc<Self>) {
+        let idx = self.sort_dropdown.selected() as usize;
+        if let Some((key, _)) = self.sort_keys.get(idx) {
+            let key = key.clone();
+            let desc = self.desc_check.is_active();
+            self.session.borrow_mut().apply_sort(&key, desc);
+            self.refresh();
+        }
+    }
+
+    fn toggle_info(&self) {
+        self.info_panel.set_visible(!self.info_panel.is_visible());
+    }
+
+    fn update_info(&self) {
+        while let Some(child) = self.info_rows.first_child() {
+            self.info_rows.remove(&child);
+        }
+        let s = self.session.borrow();
+        let item = match s.current() {
+            Some(i) => i,
+            None => return,
+        };
+        self.add_section("Image");
+        if let Some(pb) = self.orig_pixbuf.borrow().as_ref() {
+            let (w, h) = (pb.width(), pb.height());
+            let mp = (w as f64 * h as f64) / 1_000_000.0;
+            self.add_row("Resolution", &format!("{w} × {h}  ({mp:.1} MP)"), false);
+        }
+        self.add_row("File size", &human_size(item.size_bytes()), false);
+        if let Some(m) = format_mtime(item.mtime()) {
+            self.add_row("Modified", &m, false);
+        }
+        self.add_row("Path", &item.rel_path, false);
+
+        if !s.metadata.is_empty() {
+            self.add_section("Metadata");
+            if let Some(row) = s.metadata.get(&item.rel_path) {
+                for col in &s.metadata.columns {
+                    let val = row.get(col).map(|v| v.as_str()).unwrap_or("");
+                    self.add_row(col, val, true);
+                }
+            }
+        }
+    }
+
+    fn add_section(&self, title: &str) {
+        let l = Label::builder().use_markup(true).xalign(0.0).margin_top(8).margin_bottom(2).build();
+        l.set_markup(&format!("<b>{}</b>", glib::markup_escape_text(title)));
+        self.info_rows.append(&l);
+    }
+
+    fn add_row(&self, key: &str, value: &str, linkify: bool) {
+        let row = gtk4::Box::new(Orientation::Horizontal, 6);
+        let k = Label::builder()
+            .label(format!("{key}:"))
+            .xalign(0.0)
+            .valign(gtk4::Align::Start)
+            .width_request(92)
+            .wrap(true)
+            .build();
+        k.add_css_class("dim-label");
+        let v = Label::builder().xalign(0.0).wrap(true).hexpand(true).selectable(true).build();
+        if linkify {
+            let (markup, has) = linkify_markup(value);
+            if has {
+                v.set_markup(&markup);
+                let win = self.window.clone();
+                v.connect_activate_link(move |_l, uri| {
+                    gtk4::show_uri(Some(&win), uri, 0);
+                    glib::Propagation::Stop
+                });
+            } else {
+                v.set_text(value);
+            }
+        } else {
+            v.set_text(value);
+        }
+        row.append(&k);
+        row.append(&v);
+        self.info_rows.append(&row);
     }
 
     fn menu_action(self: &Rc<Self>, a: MenuAction) {
@@ -658,6 +854,7 @@ impl App {
                 gdk::Key::braceleft => app.bump_gamma(-GAMMA_STEP),
                 gdk::Key::backslash => app.reset_adjustments(),
                 gdk::Key::F11 => app.toggle_fullscreen(),
+                gdk::Key::i => app.toggle_info(),
                 gdk::Key::question | gdk::Key::F1 => app.show_help(),
                 _ => return Proceed,
             }
