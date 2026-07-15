@@ -17,10 +17,12 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, DragSource, EventControllerKey, EventControllerScroll,
-    EventControllerScrollFlags, GestureClick, GestureDrag, Label, Orientation, Picture,
-    PropagationPhase, ScrolledWindow,
+    EventControllerScrollFlags, GestureClick, GestureDrag, Label, Orientation, PropagationPhase,
+    ScrolledWindow,
 };
 use winnow_core::Session;
+
+use crate::imageview::ImageView;
 
 const MIN_SCALE: f64 = 0.05; // absolute floor, used before the view is sized
 const MAX_SCALE: f64 = 40.0;
@@ -70,8 +72,7 @@ fn adjust_pixbuf(orig: &Pixbuf, brightness: f64, gamma: f64) -> Pixbuf {
 pub struct App {
     session: RefCell<Session>,
     window: ApplicationWindow,
-    picture: Picture,
-    scroller: ScrolledWindow,
+    view: ImageView,
     status: Label,
     msg_label: Label,
     info_panel: gtk4::Box,
@@ -88,15 +89,12 @@ pub struct App {
     in_grid: Cell<bool>,
     orig_pixbuf: RefCell<Option<Pixbuf>>,
     cur_path: RefCell<PathBuf>,
-    scale: Cell<f64>,
-    fitted: Cell<bool>,
     brightness: Cell<f64>,
     gamma: Cell<f64>,
     msg_gen: Cell<u64>,
     pan_start: Cell<(f64, f64)>,
     pan_active: Cell<bool>,
-    pointer: Cell<(f64, f64)>,            // last pointer pos over the viewport
-    pending_scroll: Cell<Option<(f64, f64)>>, // zoom-to-cursor target, applied on relayout
+    pointer: Cell<(f64, f64)>, // last pointer pos over the view
 }
 
 fn event_has_ctrl(ev: Option<gdk::Event>) -> bool {
@@ -174,14 +172,9 @@ enum MenuAction {
 
 impl App {
     pub fn new(gtkapp: &Application, session: Session, sort: Option<(String, bool)>) -> Rc<App> {
-        let picture = Picture::new();
-        picture.set_keep_aspect_ratio(true);
-        picture.set_can_shrink(true);
-        // halign/valign are set per-mode in apply_scale (Fill to fit, Center to zoom).
-
-        let scroller =
-            ScrolledWindow::builder().hexpand(true).vexpand(true).child(&picture).build();
-        scroller.set_kinetic_scrolling(false);
+        let view = ImageView::new();
+        view.set_hexpand(true);
+        view.set_vexpand(true);
 
         // Status bar: persistent counter/name on the left, transient action
         // messages on the right, so a "Rejected …" flash never hides the counter.
@@ -197,7 +190,7 @@ impl App {
         status_bar.append(&msg_label);
 
         let vbox = gtk4::Box::new(Orientation::Vertical, 0);
-        vbox.append(&scroller);
+        vbox.append(&view);
         vbox.append(&status_bar);
 
         // ---- info / sort side panel ----
@@ -266,8 +259,7 @@ impl App {
         let app = Rc::new(App {
             session: RefCell::new(session),
             window,
-            picture,
-            scroller,
+            view,
             status,
             msg_label,
             info_panel,
@@ -284,15 +276,12 @@ impl App {
             in_grid: Cell::new(false),
             orig_pixbuf: RefCell::new(None),
             cur_path: RefCell::new(PathBuf::new()),
-            scale: Cell::new(1.0),
-            fitted: Cell::new(true),
             brightness: Cell::new(1.0),
             gamma: Cell::new(1.0),
             msg_gen: Cell::new(0),
             pan_start: Cell::new((0.0, 0.0)),
             pan_active: Cell::new(false),
             pointer: Cell::new((0.0, 0.0)),
-            pending_scroll: Cell::new(None),
         });
 
         app.build_controllers();
@@ -319,30 +308,32 @@ impl App {
                     Ok(pb) => {
                         let pb = pb.apply_embedded_orientation().unwrap_or(pb);
                         *self.orig_pixbuf.borrow_mut() = Some(pb);
+                        // New image starts fitted (so it fills the viewport).
+                        self.view.set_fitted(true);
                         self.render();
-                        self.apply_scale();
+                        self.update_cursor();
                     }
                     Err(_) => {
                         *self.orig_pixbuf.borrow_mut() = None;
-                        self.picture.set_paintable(None::<&gdk::Texture>);
+                        self.view.set_texture(None);
                     }
                 }
             }
             None => {
                 *self.orig_pixbuf.borrow_mut() = None;
-                self.picture.set_paintable(None::<&gdk::Texture>);
+                self.view.set_texture(None);
             }
         }
         self.update_status();
         self.update_info();
     }
 
-    /// Re-apply brightness/gamma to the current image (keeps zoom).
+    /// Re-apply brightness/gamma to the current image (keeps zoom/pan).
     fn render(&self) {
         if let Some(orig) = self.orig_pixbuf.borrow().as_ref() {
             let adj = adjust_pixbuf(orig, self.brightness.get(), self.gamma.get());
             let tex = gdk::Texture::for_pixbuf(&adj);
-            self.picture.set_paintable(Some(&tex));
+            self.view.set_texture(Some(tex));
         }
     }
 
@@ -373,44 +364,6 @@ impl App {
     // Fit mode leaves the Picture with no explicit size, so GtkPicture fills
     // the viewport and auto-scales (upscaling small images, following resizes).
     // Zooming sets an explicit size the ScrolledWindow can pan around.
-    fn viewport_fit(&self) -> Option<f64> {
-        let p = self.picture.paintable()?;
-        let (iw, ih) = (p.intrinsic_width() as f64, p.intrinsic_height() as f64);
-        let (vw, vh) = (self.scroller.width() as f64, self.scroller.height() as f64);
-        if iw > 0.0 && ih > 0.0 && vw > 0.0 && vh > 0.0 {
-            Some((vw / iw).min(vh / ih))
-        } else {
-            None
-        }
-    }
-
-    fn effective_scale(&self) -> f64 {
-        if self.fitted.get() {
-            self.viewport_fit().unwrap_or(1.0)
-        } else {
-            self.scale.get()
-        }
-    }
-
-    fn apply_scale(&self) {
-        if self.fitted.get() {
-            self.picture.set_halign(gtk4::Align::Fill);
-            self.picture.set_valign(gtk4::Align::Fill);
-            self.picture.set_size_request(-1, -1);
-        } else {
-            self.picture.set_halign(gtk4::Align::Center);
-            self.picture.set_valign(gtk4::Align::Center);
-            if let Some(p) = self.picture.paintable() {
-                let s = self.scale.get();
-                self.picture.set_size_request(
-                    (p.intrinsic_width() as f64 * s).round() as i32,
-                    (p.intrinsic_height() as f64 * s).round() as i32,
-                );
-            }
-        }
-        self.update_cursor();
-    }
-
     fn update_cursor(&self) {
         let name = if self.pan_active.get() {
             "grabbing"
@@ -419,59 +372,78 @@ impl App {
         } else {
             "default"
         };
-        self.picture.set_cursor_from_name(Some(name));
+        self.view.set_cursor_from_name(Some(name));
     }
 
     fn fit(&self) {
-        self.fitted.set(true);
-        self.apply_scale();
+        self.view.set_fitted(true);
+        self.update_cursor();
+    }
+
+    /// Clamp an image offset so it can't be panned out of view.
+    fn clamp_offset(&self, dx: f64, dy: f64, s: f64) -> (f64, f64) {
+        let (tw, th) = self.view.tex_size().unwrap_or((0.0, 0.0));
+        let (ww, wh) = (self.view.width() as f64, self.view.height() as f64);
+        let (dw, dh) = (tw * s, th * s);
+        let cx = if dw <= ww { (ww - dw) / 2.0 } else { dx.clamp(ww - dw, 0.0) };
+        let cy = if dh <= wh { (wh - dh) / 2.0 } else { dy.clamp(wh - dh, 0.0) };
+        (cx, cy)
+    }
+
+    fn set_zoom(&self, s: f64, dx: f64, dy: f64) {
+        let (cx, cy) = self.clamp_offset(dx, dy, s);
+        self.view.set_scale(s);
+        self.view.set_offset((cx, cy));
+        self.view.set_fitted(false);
+        self.update_cursor();
     }
 
     fn actual_size(&self) {
-        self.scale.set(1.0);
-        self.fitted.set(false);
-        self.apply_scale();
+        let (tw, th) = self.view.tex_size().unwrap_or((0.0, 0.0));
+        let (ww, wh) = (self.view.width() as f64, self.view.height() as f64);
+        self.set_zoom(1.0, (ww - tw) / 2.0, (wh - th) / 2.0);
     }
 
-    /// Zoom by `factor`, keeping the point at viewport coords (fx, fy) fixed.
+    /// Zoom by `factor`, keeping the image point under (fx, fy) fixed.
     fn zoom_at(&self, factor: f64, fx: f64, fy: f64) {
-        let fit = self.viewport_fit().unwrap_or(0.0);
-        let old = self.effective_scale();
+        let (s_old, dx_old, dy_old) = match self.view.display() {
+            Some(d) => d,
+            None => return,
+        };
+        let fit = self.view.fit_scale().unwrap_or(0.0);
         let lo = if fit > 0.0 { fit } else { MIN_SCALE };
-        let new = (old * factor).clamp(lo, MAX_SCALE);
+        let new = (s_old * factor).clamp(lo, MAX_SCALE);
         if new <= fit + 1e-6 {
             self.fit(); // zoomed back out to fit -> fill mode
             return;
         }
-        if (new - old).abs() < 1e-9 {
+        if (new - s_old).abs() < 1e-9 {
             return;
         }
-        let hadj = self.scroller.hadjustment();
-        let vadj = self.scroller.vadjustment();
-        let ix = (hadj.value() + fx) / old;
-        let iy = (vadj.value() + fy) / old;
-        self.pending_scroll.set(Some((ix * new - fx, iy * new - fy)));
-        self.scale.set(new);
-        self.fitted.set(false);
-        self.apply_scale();
+        let dx = fx - (fx - dx_old) * (new / s_old);
+        let dy = fy - (fy - dy_old) * (new / s_old);
+        self.set_zoom(new, dx, dy);
     }
 
     fn zoom(&self, factor: f64) {
-        let (w, h) = (self.scroller.width() as f64, self.scroller.height() as f64);
+        let (w, h) = (self.view.width() as f64, self.view.height() as f64);
         self.zoom_at(factor, w / 2.0, h / 2.0);
     }
 
     fn can_pan(&self) -> bool {
-        let h = self.scroller.hadjustment();
-        let v = self.scroller.vadjustment();
-        h.upper() > h.page_size() + 0.5 || v.upper() > v.page_size() + 0.5
+        if self.view.is_fitted() {
+            return false;
+        }
+        let (tw, th) = self.view.tex_size().unwrap_or((0.0, 0.0));
+        let s = self.view.scale();
+        let (ww, wh) = (self.view.width() as f64, self.view.height() as f64);
+        tw * s > ww + 0.5 || th * s > wh + 0.5
     }
 
     // ---- brightness -----------------------------------------------
     fn bump_brightness(self: &Rc<Self>, delta: f64) {
         self.brightness.set((self.brightness.get() + delta).clamp(0.1, 5.0));
         self.render();
-        self.apply_scale();
         self.flash(format!("Brightness {:.0}%", self.brightness.get() * 100.0));
     }
 
@@ -479,19 +451,16 @@ impl App {
     fn set_brightness(&self, v: f64) {
         self.brightness.set(v.clamp(0.1, 5.0));
         self.render();
-        self.apply_scale();
     }
 
     fn set_gamma(&self, v: f64) {
         self.gamma.set(v.clamp(0.1, 5.0));
         self.render();
-        self.apply_scale();
     }
 
     fn bump_gamma(self: &Rc<Self>, delta: f64) {
         self.gamma.set((self.gamma.get() + delta).clamp(0.1, 5.0));
         self.render();
-        self.apply_scale();
         self.flash(format!("Gamma {:.2}", self.gamma.get()));
     }
 
@@ -499,7 +468,6 @@ impl App {
         self.brightness.set(1.0);
         self.gamma.set(1.0);
         self.render();
-        self.apply_scale();
         self.flash("Reset brightness & gamma".into());
     }
 
@@ -903,7 +871,7 @@ impl App {
 
     fn build_context_menu(self: &Rc<Self>) {
         let popover = gtk4::Popover::new();
-        popover.set_parent(&self.picture);
+        popover.set_parent(&self.view);
         popover.set_has_arrow(false);
         popover.set_halign(gtk4::Align::Start);
 
@@ -957,7 +925,7 @@ impl App {
             popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
             popover.popup();
         });
-        self.picture.add_controller(click);
+        self.view.add_controller(click);
     }
 
     fn build_keys(self: &Rc<Self>) {
@@ -1095,13 +1063,13 @@ impl App {
     }
 
     fn build_scroll(self: &Rc<Self>) {
-        // Track the pointer over the viewport for zoom-to-cursor.
+        // Track the pointer over the view for zoom-to-cursor.
         let motion = gtk4::EventControllerMotion::new();
         {
             let app = self.clone();
             motion.connect_motion(move |_c, x, y| app.pointer.set((x, y)));
         }
-        self.scroller.add_controller(motion);
+        self.view.add_controller(motion);
 
         let scroll = EventControllerScroll::new(EventControllerScrollFlags::VERTICAL);
         scroll.set_propagation_phase(PropagationPhase::Capture);
@@ -1113,20 +1081,7 @@ impl App {
                 glib::Propagation::Stop
             });
         }
-        self.scroller.add_controller(scroll);
-
-        // A zoom changes the content size asynchronously; apply the pending
-        // zoom-to-cursor scroll position once the adjustments have updated.
-        {
-            let app = self.clone();
-            let vadj = self.scroller.vadjustment();
-            self.scroller.hadjustment().connect_changed(move |hadj| {
-                if let Some((th, tv)) = app.pending_scroll.take() {
-                    hadj.set_value(th);
-                    vadj.set_value(tv);
-                }
-            });
-        }
+        self.view.add_controller(scroll);
     }
 
     fn build_mouse(self: &Rc<Self>) {
@@ -1134,14 +1089,14 @@ impl App {
         let mid = GestureDrag::new();
         mid.set_button(gdk::BUTTON_MIDDLE);
         self.wire_pan_gesture(&mid, false);
-        self.picture.add_controller(mid);
+        self.view.add_controller(mid);
 
         // Left-drag pans when zoomed in (else it becomes an OS drag-out; see
         // build_drag_source). Ctrl forces drag-out even when zoomed.
         let left = GestureDrag::new();
         left.set_button(gdk::BUTTON_PRIMARY);
         self.wire_pan_gesture(&left, true);
-        self.picture.add_controller(left);
+        self.view.add_controller(left);
 
         // Double-click toggles fullscreen; mouse Back/Forward navigate.
         let click = GestureClick::new();
@@ -1161,10 +1116,10 @@ impl App {
                 _ => {}
             }
         });
-        self.picture.add_controller(click);
+        self.view.add_controller(click);
     }
 
-    /// Wire a GestureDrag to pan the scroller. `conditional` gestures (left
+    /// Wire a GestureDrag to pan the image. `conditional` gestures (left
     /// button) only pan when the image is zoomed and Ctrl isn't held, yielding
     /// the sequence otherwise so the drag source can start an OS drag-out.
     fn wire_pan_gesture(self: &Rc<Self>, g: &GestureDrag, conditional: bool) {
@@ -1175,10 +1130,7 @@ impl App {
                 app.pan_active.set(active);
                 if active {
                     g.set_state(gtk4::EventSequenceState::Claimed);
-                    app.pan_start.set((
-                        app.scroller.hadjustment().value(),
-                        app.scroller.vadjustment().value(),
-                    ));
+                    app.pan_start.set(app.view.offset());
                     app.update_cursor();
                 } else {
                     g.set_state(gtk4::EventSequenceState::Denied);
@@ -1189,9 +1141,10 @@ impl App {
             let app = self.clone();
             g.connect_drag_update(move |_g, ox, oy| {
                 if app.pan_active.get() {
-                    let (sh, sv) = app.pan_start.get();
-                    app.scroller.hadjustment().set_value(sh - ox);
-                    app.scroller.vadjustment().set_value(sv - oy);
+                    let (sx, sy) = app.pan_start.get();
+                    let s = app.view.scale();
+                    let (cx, cy) = app.clamp_offset(sx + ox, sy + oy, s);
+                    app.view.set_offset((cx, cy));
                 }
             });
         }
@@ -1240,6 +1193,6 @@ impl App {
                 }
             });
         }
-        self.picture.add_controller(drag);
+        self.view.add_controller(drag);
     }
 }

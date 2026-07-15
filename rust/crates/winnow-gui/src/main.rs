@@ -1,6 +1,7 @@
 //! winnow — GTK4 image culling tool (Rust rewrite). Entry point + CLI.
 
 mod app;
+mod imageview;
 
 use std::path::PathBuf;
 
