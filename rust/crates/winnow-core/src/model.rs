@@ -136,6 +136,23 @@ impl Session {
         })
     }
 
+    /// An empty session (no folder open). Used when winnow is launched with no
+    /// path so it doesn't scan the current directory.
+    pub fn empty() -> Session {
+        Session {
+            root: PathBuf::new(),
+            recursive: true,
+            buckets: vec![crate::buckets::default_reject()],
+            metadata: Metadata::default(),
+            items: Vec::new(),
+            index: 0,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            sort_key: "name".into(),
+            sort_reverse: false,
+        }
+    }
+
     // ---- navigation ------------------------------------------------
     pub fn count(&self) -> usize {
         self.items.len()

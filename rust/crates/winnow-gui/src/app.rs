@@ -89,6 +89,7 @@ pub struct App {
     in_grid: Cell<bool>,
     orig_pixbuf: RefCell<Option<Pixbuf>>,
     cur_path: RefCell<PathBuf>,
+    open_dialog: RefCell<Option<gtk4::FileChooserNative>>,
     brightness: Cell<f64>,
     gamma: Cell<f64>,
     msg_gen: Cell<u64>,
@@ -276,6 +277,7 @@ impl App {
             in_grid: Cell::new(false),
             orig_pixbuf: RefCell::new(None),
             cur_path: RefCell::new(PathBuf::new()),
+            open_dialog: RefCell::new(None),
             brightness: Cell::new(1.0),
             gamma: Cell::new(1.0),
             msg_gen: Cell::new(0),
@@ -340,12 +342,17 @@ impl App {
     // ---- status bar -----------------------------------------------
     fn update_status(&self) {
         let s = self.session.borrow();
-        let text = match s.current() {
-            Some(item) => format!("{}/{} — {}", s.index + 1, s.count(), item.rel_path),
-            None => "0/0 — empty".to_string(),
-        };
-        self.status.set_text(&text);
-        self.window.set_title(Some(&text));
+        match s.current() {
+            Some(item) => {
+                let text = format!("{}/{} — {}", s.index + 1, s.count(), item.rel_path);
+                self.status.set_text(&text);
+                self.window.set_title(Some(&text));
+            }
+            None => {
+                self.status.set_text("No folder open — press Ctrl+O or “Open”");
+                self.window.set_title(Some("winnow"));
+            }
+        }
     }
 
     fn flash(self: &Rc<Self>, text: String) {
@@ -551,6 +558,46 @@ impl App {
         }
     }
 
+    // ---- open a folder --------------------------------------------
+    fn open_folder(self: &Rc<Self>) {
+        let chooser = gtk4::FileChooserNative::builder()
+            .title("Open image folder")
+            .action(gtk4::FileChooserAction::SelectFolder)
+            .transient_for(&self.window)
+            .modal(true)
+            .accept_label("Open")
+            .cancel_label("Cancel")
+            .build();
+        let app = self.clone();
+        chooser.connect_response(move |ch, resp| {
+            if resp == gtk4::ResponseType::Accept {
+                if let Some(path) = ch.file().and_then(|f| f.path()) {
+                    app.load_folder(&path);
+                }
+            }
+            app.open_dialog.replace(None);
+        });
+        // Keep it alive until the user responds.
+        self.open_dialog.replace(Some(chooser.clone()));
+        chooser.show();
+    }
+
+    /// Load a folder (or single image) into a fresh window, replacing this one.
+    fn load_folder(self: &Rc<Self>, target: &std::path::Path) {
+        match crate::open_target(target, true, None, None) {
+            Ok((mut session, start)) => {
+                if let Some(i) = start {
+                    session.set_index(i as isize);
+                }
+                if let Some(gtkapp) = self.window.application() {
+                    App::new(&gtkapp, session, None);
+                    self.window.close();
+                }
+            }
+            Err(e) => self.flash(format!("Open failed: {e}")),
+        }
+    }
+
     // ---- help ------------------------------------------------------
     fn help_markup(&self) -> String {
         fn row(key: &str, desc: &str) -> String {
@@ -600,6 +647,7 @@ impl App {
                 row("Left-drag (fit) / Ctrl+drag", "Drag file out (copy)"),
                 row("Ctrl+C / Ctrl+Shift+C", "Copy filename / path"),
                 row("Ctrl+Shift+X", "Copy image file to clipboard"),
+                row("Ctrl+O", "Open a folder"),
                 row("F11", "Fullscreen"),
                 row("? / F1", "This shortcuts list"),
             ]
@@ -656,6 +704,14 @@ impl App {
 
     fn build_header(self: &Rc<Self>) {
         let header = gtk4::HeaderBar::new();
+
+        let open_btn = gtk4::Button::with_label("Open");
+        open_btn.set_tooltip_text(Some("Open a folder (Ctrl+O)"));
+        {
+            let app = self.clone();
+            open_btn.connect_clicked(move |_| app.open_folder());
+        }
+        header.pack_start(&open_btn);
 
         let grid_btn = gtk4::Button::with_label("Grid");
         grid_btn.set_tooltip_text(Some("Grid / single view (G)"));
@@ -989,6 +1045,7 @@ impl App {
                     gdk::Key::c if shift => app.copy_path(),
                     gdk::Key::c => app.copy_name(),
                     gdk::Key::x if shift => app.copy_file(),
+                    gdk::Key::o => app.open_folder(),
                     _ => return Proceed,
                 }
                 return Stop;

@@ -65,42 +65,45 @@ fn main() -> glib::ExitCode {
     application.run_with_args::<&str>(&[])
 }
 
-fn activate(gtkapp: &Application, cli: &Cli) {
-    let target = cli
-        .folder
-        .clone()
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+/// Build a session for a folder or single image, auto-detecting metadata and
+/// resolving the start index for a single-image target. Reused by the CLI and
+/// the in-app "Open folder" action.
+pub fn open_target(
+    target: &std::path::Path,
+    recursive: bool,
+    metadata: Option<PathBuf>,
+    buckets: Option<PathBuf>,
+) -> Result<(Session, Option<usize>), winnow_core::buckets::BucketError> {
     let (root, start_file) = if target.is_file() {
-        (target.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| target.clone()), Some(target.clone()))
+        (target.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| target.to_path_buf()), Some(target.to_path_buf()))
     } else {
-        (target, None)
+        (target.to_path_buf(), None)
+    };
+    let meta = metadata.or_else(|| AUTO_METADATA.iter().map(|n| root.join(n)).find(|p| p.exists()));
+    let session = Session::new(&root, recursive, buckets.as_deref(), meta.as_deref())?;
+    let start = start_file.and_then(|f| session.items.iter().position(|it| it.abs_path == f));
+    Ok((session, start))
+}
+
+fn activate(gtkapp: &Application, cli: &Cli) {
+    // No path given (bare `winnow`, or the launcher with no file) -> open empty
+    // rather than scanning the current directory.
+    let Some(folder) = cli.folder.clone() else {
+        App::new(gtkapp, Session::empty(), None);
+        return;
     };
 
-    let meta = cli
-        .metadata
-        .clone()
-        .or_else(|| AUTO_METADATA.iter().map(|n| root.join(n)).find(|p| p.exists()));
-    if cli.metadata.is_none() {
-        if let Some(m) = &meta {
-            eprintln!("using metadata: {}", m.file_name().unwrap_or_default().to_string_lossy());
-        }
-    }
-
-    let session = match Session::new(&root, !cli.no_recursive, cli.buckets.as_deref(), meta.as_deref()) {
-        Ok(mut s) => {
-            if let Some(f) = &start_file {
-                if let Some(i) = s.items.iter().position(|it| &it.abs_path == f) {
-                    s.set_index(i as isize);
-                }
+    match open_target(&folder, !cli.no_recursive, cli.metadata.clone(), cli.buckets.clone()) {
+        Ok((mut session, start)) => {
+            if let Some(i) = start {
+                session.set_index(i as isize);
             }
-            s
+            let sort = cli.sort.clone().map(|k| (k, cli.sort_desc));
+            App::new(gtkapp, session, sort);
         }
         Err(e) => {
             eprintln!("winnow: {e}");
             std::process::exit(1);
         }
-    };
-
-    let sort = cli.sort.clone().map(|k| (k, cli.sort_desc));
-    App::new(gtkapp, session, sort);
+    }
 }
