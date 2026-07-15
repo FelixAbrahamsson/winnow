@@ -10,7 +10,7 @@ image viewer and mash Delete".
 > **Note:** winnow was rewritten from Python/PySide6 to Rust/GTK4 for a tiny
 > (~1 MB vs ~90 MB) native binary. The workspace lives in `rust/`
 > (`winnow-core` = pure logic + tests, `winnow-gui` = the GTK front-end). The
-> original Python implementation remains in `src/winnow/` for reference.
+> original Python implementation is preserved in the `v0.1.1` git tag.
 
 ## Why this instead of the built-in viewer
 
@@ -77,7 +77,7 @@ winnow /path/to/images/img_0007.jpg    # open a single image (starts on it)
 The `install.sh` binary installer registers this automatically. Otherwise run:
 
 ```bash
-winnow --install-desktop        # or, in a dev checkout: ./scripts/install-desktop.sh
+winnow --install-desktop
 ```
 
 Then right-click a folder **or** an image in your file manager and pick
