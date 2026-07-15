@@ -73,6 +73,7 @@ pub struct App {
     picture: Picture,
     scroller: ScrolledWindow,
     status: Label,
+    msg_label: Label,
     info_panel: gtk4::Box,
     info_rows: gtk4::Box,
     sort_keys: Vec<(String, String)>,
@@ -182,17 +183,22 @@ impl App {
             ScrolledWindow::builder().hexpand(true).vexpand(true).child(&picture).build();
         scroller.set_kinetic_scrolling(false);
 
-        let status = Label::builder()
-            .xalign(0.0)
-            .margin_start(8)
-            .margin_end(8)
-            .margin_top(3)
-            .margin_bottom(3)
-            .build();
+        // Status bar: persistent counter/name on the left, transient action
+        // messages on the right, so a "Rejected …" flash never hides the counter.
+        let status = Label::builder().xalign(0.0).hexpand(true).build();
+        let msg_label = Label::builder().xalign(1.0).build();
+        msg_label.add_css_class("dim-label");
+        let status_bar = gtk4::Box::new(Orientation::Horizontal, 12);
+        status_bar.set_margin_start(8);
+        status_bar.set_margin_end(8);
+        status_bar.set_margin_top(3);
+        status_bar.set_margin_bottom(3);
+        status_bar.append(&status);
+        status_bar.append(&msg_label);
 
         let vbox = gtk4::Box::new(Orientation::Vertical, 0);
         vbox.append(&scroller);
-        vbox.append(&status);
+        vbox.append(&status_bar);
 
         // ---- info / sort side panel ----
         let sort_keys: Vec<(String, String)> = session.sortable_keys();
@@ -263,6 +269,7 @@ impl App {
             picture,
             scroller,
             status,
+            msg_label,
             info_panel,
             info_rows,
             sort_keys,
@@ -353,11 +360,11 @@ impl App {
     fn flash(self: &Rc<Self>, text: String) {
         let g = self.msg_gen.get().wrapping_add(1);
         self.msg_gen.set(g);
-        self.status.set_text(&text);
+        self.msg_label.set_text(&text); // separate label — never hides the counter
         let app = self.clone();
         glib::timeout_add_local_once(Duration::from_secs(4), move || {
             if app.msg_gen.get() == g {
-                app.update_status();
+                app.msg_label.set_text("");
             }
         });
     }
