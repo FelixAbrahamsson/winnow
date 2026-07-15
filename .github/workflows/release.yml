@@ -30,16 +30,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
 
       - name: Build release binary
-        working-directory: rust
         run: cargo build --release -p winnow-gui --locked
 
       - name: Package
         run: |
-          install -m755 rust/target/release/winnow winnow
+          install -m755 target/release/winnow winnow
           tar -czf winnow-linux-x86_64.tar.gz winnow
           sha256sum winnow-linux-x86_64.tar.gz | tee winnow-linux-x86_64.tar.gz.sha256
 

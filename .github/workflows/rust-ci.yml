@@ -2,10 +2,10 @@ name: rust-ci
 
 on:
   push:
-    branches: [master, rust-rewrite]
-    paths: ["rust/**", ".github/workflows/rust-ci.yml"]
+    branches: [master]
+    paths: ["crates/**", "Cargo.toml", "Cargo.lock", ".github/workflows/rust-ci.yml"]
   pull_request:
-    paths: ["rust/**", ".github/workflows/rust-ci.yml"]
+    paths: ["crates/**", "Cargo.toml", "Cargo.lock", ".github/workflows/rust-ci.yml"]
 
 jobs:
   build-test:
@@ -23,17 +23,12 @@ jobs:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
 
       - name: Build workspace
-        working-directory: rust
         run: cargo build --workspace --locked
 
       - name: Test winnow-core
-        working-directory: rust
         run: cargo test -p winnow-core --locked
 
       - name: Clippy (core)
-        working-directory: rust
         run: cargo clippy -p winnow-core --locked -- -D warnings

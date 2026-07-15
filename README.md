@@ -8,9 +8,9 @@ Native Linux app (Rust / GTK4). Purpose-built to replace "open the GNOME
 image viewer and mash Delete".
 
 > **Note:** winnow was rewritten from Python/PySide6 to Rust/GTK4 for a tiny
-> (~1 MB vs ~90 MB) native binary. The workspace lives in `rust/`
-> (`winnow-core` = pure logic + tests, `winnow-gui` = the GTK front-end). The
-> original Python implementation is preserved in the `v0.1.1` git tag.
+> (~1 MB vs ~90 MB) native binary. It's a Cargo workspace: `winnow-core`
+> (pure logic + tests) and `winnow-gui` (the GTK front-end). The original
+> Python implementation is preserved in the `v0.1.1` git tag.
 
 ## Why this instead of the built-in viewer
 
@@ -55,7 +55,6 @@ winnow --install-desktop      # optional: register the Open With launcher
 
 ```bash
 sudo apt-get install -y libgtk-4-dev
-cd rust
 cargo test -p winnow-core          # pure-logic unit tests
 cargo run -p winnow-gui -- /path/to/images
 ```
@@ -70,7 +69,7 @@ winnow /path/to/images --sort meta:severity --sort-desc
 winnow /path/to/images/img_0007.jpg    # open a single image (starts on it)
 ```
 
-(In a dev checkout, prefix with `cargo run -p winnow-gui --` from `rust/`.)
+(In a dev checkout, prefix with `cargo run -p winnow-gui --`.)
 
 ## Right-click "Open With" integration
 
@@ -100,8 +99,8 @@ a Release, which `install.sh` then downloads:
 git tag v0.2.0 && git push origin v0.2.0
 ```
 
-To build the binary locally: `cd rust && cargo build --release -p winnow-gui`
-(output at `rust/target/release/winnow`, ~1 MB).
+To build the binary locally: `cargo build --release -p winnow-gui`
+(output at `target/release/winnow`, ~1 MB).
 
 ## Keybindings
 
