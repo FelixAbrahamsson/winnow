@@ -94,6 +94,8 @@ pub struct App {
     msg_gen: Cell<u64>,
     pan_start: Cell<(f64, f64)>,
     pan_active: Cell<bool>,
+    pointer: Cell<(f64, f64)>,            // last pointer pos over the viewport
+    pending_scroll: Cell<Option<(f64, f64)>>, // zoom-to-cursor target, applied on relayout
 }
 
 fn event_has_ctrl(ev: Option<gdk::Event>) -> bool {
@@ -174,8 +176,7 @@ impl App {
         let picture = Picture::new();
         picture.set_keep_aspect_ratio(true);
         picture.set_can_shrink(true);
-        picture.set_halign(gtk4::Align::Center);
-        picture.set_valign(gtk4::Align::Center);
+        // halign/valign are set per-mode in apply_scale (Fill to fit, Center to zoom).
 
         let scroller =
             ScrolledWindow::builder().hexpand(true).vexpand(true).child(&picture).build();
@@ -215,15 +216,22 @@ impl App {
             ScrolledWindow::builder().hexpand(true).vexpand(true).child(&info_rows).build();
 
         let info_panel = gtk4::Box::new(Orientation::Vertical, 0);
-        info_panel.set_width_request(280);
+        info_panel.set_width_request(200);
         info_panel.append(&sort_row);
         info_panel.append(&gtk4::Separator::new(Orientation::Horizontal));
         info_panel.append(&info_scroll);
 
-        let hbox = gtk4::Box::new(Orientation::Horizontal, 0);
-        hbox.append(&vbox);
-        hbox.append(&gtk4::Separator::new(Orientation::Vertical));
-        hbox.append(&info_panel);
+        // Resizable split: drag the divider to size the details panel.
+        let paned = gtk4::Paned::new(Orientation::Horizontal);
+        paned.set_start_child(Some(&vbox));
+        paned.set_end_child(Some(&info_panel));
+        paned.set_resize_start_child(true);
+        paned.set_resize_end_child(false);
+        paned.set_shrink_start_child(false);
+        paned.set_shrink_end_child(true);
+        paned.set_position(960);
+        paned.set_wide_handle(true);
+        let hbox = paned;
 
         // ---- thumbnail grid page ----
         let grid_model = gtk4::StringList::new(&[]);
@@ -276,6 +284,8 @@ impl App {
             msg_gen: Cell::new(0),
             pan_start: Cell::new((0.0, 0.0)),
             pan_active: Cell::new(false),
+            pointer: Cell::new((0.0, 0.0)),
+            pending_scroll: Cell::new(None),
         });
 
         app.build_controllers();
@@ -289,12 +299,6 @@ impl App {
             app.apply_sort_from_ui();
         }
         app.window.present();
-
-        // Fit once the viewport has a real size.
-        {
-            let app = app.clone();
-            glib::timeout_add_local_once(Duration::from_millis(30), move || app.fit());
-        }
         app
     }
 
@@ -309,11 +313,6 @@ impl App {
                         let pb = pb.apply_embedded_orientation().unwrap_or(pb);
                         *self.orig_pixbuf.borrow_mut() = Some(pb);
                         self.render();
-                        if self.fitted.get() {
-                            if let Some(f) = self.viewport_fit() {
-                                self.scale.set(f.min(1.0));
-                            }
-                        }
                         self.apply_scale();
                     }
                     Err(_) => {
@@ -364,6 +363,9 @@ impl App {
     }
 
     // ---- zoom / pan -----------------------------------------------
+    // Fit mode leaves the Picture with no explicit size, so GtkPicture fills
+    // the viewport and auto-scales (upscaling small images, following resizes).
+    // Zooming sets an explicit size the ScrolledWindow can pan around.
     fn viewport_fit(&self) -> Option<f64> {
         let p = self.picture.paintable()?;
         let (iw, ih) = (p.intrinsic_width() as f64, p.intrinsic_height() as f64);
@@ -375,17 +377,29 @@ impl App {
         }
     }
 
-    fn min_scale(&self) -> f64 {
-        self.viewport_fit().map(|f| f.min(1.0)).unwrap_or(MIN_SCALE)
+    fn effective_scale(&self) -> f64 {
+        if self.fitted.get() {
+            self.viewport_fit().unwrap_or(1.0)
+        } else {
+            self.scale.get()
+        }
     }
 
     fn apply_scale(&self) {
-        if let Some(p) = self.picture.paintable() {
-            let sc = self.scale.get();
-            self.picture.set_size_request(
-                (p.intrinsic_width() as f64 * sc).round() as i32,
-                (p.intrinsic_height() as f64 * sc).round() as i32,
-            );
+        if self.fitted.get() {
+            self.picture.set_halign(gtk4::Align::Fill);
+            self.picture.set_valign(gtk4::Align::Fill);
+            self.picture.set_size_request(-1, -1);
+        } else {
+            self.picture.set_halign(gtk4::Align::Center);
+            self.picture.set_valign(gtk4::Align::Center);
+            if let Some(p) = self.picture.paintable() {
+                let s = self.scale.get();
+                self.picture.set_size_request(
+                    (p.intrinsic_width() as f64 * s).round() as i32,
+                    (p.intrinsic_height() as f64 * s).round() as i32,
+                );
+            }
         }
         self.update_cursor();
     }
@@ -401,25 +415,43 @@ impl App {
         self.picture.set_cursor_from_name(Some(name));
     }
 
-    fn zoom(&self, factor: f64) {
-        let s = (self.scale.get() * factor).clamp(self.min_scale(), MAX_SCALE);
-        self.scale.set(s);
-        self.fitted.set(false);
-        self.apply_scale();
-    }
-
     fn fit(&self) {
-        if let Some(f) = self.viewport_fit() {
-            self.scale.set(f.min(1.0));
-            self.apply_scale();
-        }
         self.fitted.set(true);
+        self.apply_scale();
     }
 
     fn actual_size(&self) {
-        self.scale.set(1.0f64.clamp(self.min_scale(), MAX_SCALE));
+        self.scale.set(1.0);
         self.fitted.set(false);
         self.apply_scale();
+    }
+
+    /// Zoom by `factor`, keeping the point at viewport coords (fx, fy) fixed.
+    fn zoom_at(&self, factor: f64, fx: f64, fy: f64) {
+        let fit = self.viewport_fit().unwrap_or(0.0);
+        let old = self.effective_scale();
+        let lo = if fit > 0.0 { fit } else { MIN_SCALE };
+        let new = (old * factor).clamp(lo, MAX_SCALE);
+        if new <= fit + 1e-6 {
+            self.fit(); // zoomed back out to fit -> fill mode
+            return;
+        }
+        if (new - old).abs() < 1e-9 {
+            return;
+        }
+        let hadj = self.scroller.hadjustment();
+        let vadj = self.scroller.vadjustment();
+        let ix = (hadj.value() + fx) / old;
+        let iy = (vadj.value() + fy) / old;
+        self.pending_scroll.set(Some((ix * new - fx, iy * new - fy)));
+        self.scale.set(new);
+        self.fitted.set(false);
+        self.apply_scale();
+    }
+
+    fn zoom(&self, factor: f64) {
+        let (w, h) = (self.scroller.width() as f64, self.scroller.height() as f64);
+        self.zoom_at(factor, w / 2.0, h / 2.0);
     }
 
     fn can_pan(&self) -> bool {
@@ -434,6 +466,19 @@ impl App {
         self.render();
         self.apply_scale();
         self.flash(format!("Brightness {:.0}%", self.brightness.get() * 100.0));
+    }
+
+    // Absolute setters used by the header-bar sliders (no status flash).
+    fn set_brightness(&self, v: f64) {
+        self.brightness.set(v.clamp(0.1, 5.0));
+        self.render();
+        self.apply_scale();
+    }
+
+    fn set_gamma(&self, v: f64) {
+        self.gamma.set(v.clamp(0.1, 5.0));
+        self.render();
+        self.apply_scale();
     }
 
     fn bump_gamma(self: &Rc<Self>, delta: f64) {
@@ -631,6 +676,97 @@ impl App {
         self.build_context_menu();
         self.build_info_controls();
         self.build_grid();
+        self.build_header();
+    }
+
+    fn build_header(self: &Rc<Self>) {
+        let header = gtk4::HeaderBar::new();
+
+        let grid_btn = gtk4::Button::with_label("Grid");
+        grid_btn.set_tooltip_text(Some("Grid / single view (G)"));
+        {
+            let app = self.clone();
+            grid_btn.connect_clicked(move |_| app.toggle_view());
+        }
+        header.pack_start(&grid_btn);
+
+        let info_btn = gtk4::Button::with_label("Details");
+        info_btn.set_tooltip_text(Some("Toggle details panel (I)"));
+        {
+            let app = self.clone();
+            info_btn.connect_clicked(move |_| app.toggle_info());
+        }
+        header.pack_start(&info_btn);
+
+        // Brightness / gamma sliders in a popover.
+        let bri_btn = gtk4::MenuButton::new();
+        bri_btn.set_label("☀ Brightness");
+        bri_btn.set_tooltip_text(Some("Brightness / gamma"));
+        let pop = gtk4::Popover::new();
+        let pbox = gtk4::Box::new(Orientation::Vertical, 4);
+        pbox.set_margin_top(8);
+        pbox.set_margin_bottom(8);
+        pbox.set_margin_start(8);
+        pbox.set_margin_end(8);
+        let bri_scale = gtk4::Scale::with_range(Orientation::Horizontal, 0.2, 3.0, 0.05);
+        bri_scale.set_value(1.0);
+        bri_scale.set_size_request(220, -1);
+        let gam_scale = gtk4::Scale::with_range(Orientation::Horizontal, 0.3, 3.0, 0.05);
+        gam_scale.set_value(1.0);
+        {
+            let app = self.clone();
+            bri_scale.connect_value_changed(move |s| app.set_brightness(s.value()));
+        }
+        {
+            let app = self.clone();
+            gam_scale.connect_value_changed(move |s| app.set_gamma(s.value()));
+        }
+        let reset = gtk4::Button::with_label("Reset");
+        {
+            let bri = bri_scale.clone();
+            let gam = gam_scale.clone();
+            reset.connect_clicked(move |_| {
+                bri.set_value(1.0);
+                gam.set_value(1.0);
+            });
+        }
+        let bl = Label::builder().label("Brightness").xalign(0.0).build();
+        let gl = Label::builder().label("Gamma").xalign(0.0).build();
+        pbox.append(&bl);
+        pbox.append(&bri_scale);
+        pbox.append(&gl);
+        pbox.append(&gam_scale);
+        pbox.append(&reset);
+        pop.set_child(Some(&pbox));
+        bri_btn.set_popover(Some(&pop));
+        header.pack_start(&bri_btn);
+
+        // Right side (packed in reverse visual order).
+        let help_btn = gtk4::Button::with_label("?");
+        help_btn.set_tooltip_text(Some("Shortcuts (?)"));
+        {
+            let app = self.clone();
+            help_btn.connect_clicked(move |_| app.show_help());
+        }
+        header.pack_end(&help_btn);
+
+        let fs_btn = gtk4::Button::with_label("Fullscreen");
+        fs_btn.set_tooltip_text(Some("Fullscreen (F11)"));
+        {
+            let app = self.clone();
+            fs_btn.connect_clicked(move |_| app.toggle_fullscreen());
+        }
+        header.pack_end(&fs_btn);
+
+        let fit_btn = gtk4::Button::with_label("Fit");
+        fit_btn.set_tooltip_text(Some("Fit to window (F)"));
+        {
+            let app = self.clone();
+            fit_btn.connect_clicked(move |_| app.fit());
+        }
+        header.pack_end(&fit_btn);
+
+        self.window.set_titlebar(Some(&header));
     }
 
     fn build_info_controls(self: &Rc<Self>) {
@@ -706,7 +842,16 @@ impl App {
             .wrap(true)
             .build();
         k.add_css_class("dim-label");
-        let v = Label::builder().xalign(0.0).wrap(true).hexpand(true).selectable(true).build();
+        // wrap(WordChar) + bounded max width so a long, space-free value folds
+        // into multiple rows instead of forcing the panel wide.
+        let v = Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .wrap_mode(gtk4::pango::WrapMode::WordChar)
+            .max_width_chars(28)
+            .hexpand(true)
+            .selectable(true)
+            .build();
         if linkify {
             let (markup, has) = linkify_markup(value);
             if has {
@@ -943,14 +1088,38 @@ impl App {
     }
 
     fn build_scroll(self: &Rc<Self>) {
+        // Track the pointer over the viewport for zoom-to-cursor.
+        let motion = gtk4::EventControllerMotion::new();
+        {
+            let app = self.clone();
+            motion.connect_motion(move |_c, x, y| app.pointer.set((x, y)));
+        }
+        self.scroller.add_controller(motion);
+
         let scroll = EventControllerScroll::new(EventControllerScrollFlags::VERTICAL);
         scroll.set_propagation_phase(PropagationPhase::Capture);
-        let app = self.clone();
-        scroll.connect_scroll(move |_c, _dx, dy| {
-            app.zoom(ZOOM_RATE.powf(-dy));
-            glib::Propagation::Stop
-        });
+        {
+            let app = self.clone();
+            scroll.connect_scroll(move |_c, _dx, dy| {
+                let (px, py) = app.pointer.get();
+                app.zoom_at(ZOOM_RATE.powf(-dy), px, py);
+                glib::Propagation::Stop
+            });
+        }
         self.scroller.add_controller(scroll);
+
+        // A zoom changes the content size asynchronously; apply the pending
+        // zoom-to-cursor scroll position once the adjustments have updated.
+        {
+            let app = self.clone();
+            let vadj = self.scroller.vadjustment();
+            self.scroller.hadjustment().connect_changed(move |hadj| {
+                if let Some((th, tv)) = app.pending_scroll.take() {
+                    hadj.set_value(th);
+                    vadj.set_value(tv);
+                }
+            });
+        }
     }
 
     fn build_mouse(self: &Rc<Self>) {
