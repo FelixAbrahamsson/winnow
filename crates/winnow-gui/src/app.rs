@@ -31,8 +31,9 @@ const KEY_ZOOM_STEP: f64 = 1.25;
 const BRIGHT_STEP: f64 = 0.1;
 const GAMMA_STEP: f64 = 0.1;
 const DEFAULT_SIZE: (i32, i32) = (1280, 820);
+const DEFAULT_INFO_WIDTH: i32 = 320;
 
-// ---- window-size persistence (remember size across launches) -------
+// ---- window-state persistence (size + info-panel width) ------------
 fn window_state_file() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
@@ -40,7 +41,7 @@ fn window_state_file() -> Option<PathBuf> {
     Some(base.join("winnow").join("window"))
 }
 
-fn save_window_state(w: i32, h: i32, maximized: bool) {
+fn save_window_state(w: i32, h: i32, maximized: bool, info_w: i32) {
     if w <= 0 || h <= 0 {
         return;
     }
@@ -48,19 +49,20 @@ fn save_window_state(w: i32, h: i32, maximized: bool) {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let _ = std::fs::write(path, format!("{w} {h} {}", maximized as u8));
+        let _ = std::fs::write(path, format!("{w} {h} {} {info_w}", maximized as u8));
     }
 }
 
-fn load_window_state() -> (i32, i32, bool) {
+fn load_window_state() -> (i32, i32, bool, i32) {
     let (dw, dh) = DEFAULT_SIZE;
-    let Some(path) = window_state_file() else { return (dw, dh, false) };
-    let Ok(s) = std::fs::read_to_string(path) else { return (dw, dh, false) };
+    let Some(path) = window_state_file() else { return (dw, dh, false, DEFAULT_INFO_WIDTH) };
+    let Ok(s) = std::fs::read_to_string(path) else { return (dw, dh, false, DEFAULT_INFO_WIDTH) };
     let mut it = s.split_whitespace();
     let w = it.next().and_then(|x| x.parse().ok()).filter(|&v| v > 0).unwrap_or(dw);
     let h = it.next().and_then(|x| x.parse().ok()).filter(|&v| v > 0).unwrap_or(dh);
     let m = it.next().and_then(|x| x.parse::<u8>().ok()).map(|v| v != 0).unwrap_or(false);
-    (w, h, m)
+    let info = it.next().and_then(|x| x.parse().ok()).filter(|&v| v > 0).unwrap_or(DEFAULT_INFO_WIDTH);
+    (w, h, m, info)
 }
 
 /// Apply brightness/gamma to a pixbuf via a per-channel LUT. Identity fast-path.
@@ -108,6 +110,8 @@ pub struct App {
     status: Label,
     msg_label: Label,
     info_panel: gtk4::Box,
+    paned: gtk4::Paned,
+    info_width: Cell<i32>,
     info_rows: gtk4::Box,
     sort_keys: Vec<(String, String)>,
     sort_dropdown: gtk4::DropDown,
@@ -253,7 +257,11 @@ impl App {
         info_panel.append(&gtk4::Separator::new(Orientation::Horizontal));
         info_panel.append(&info_scroll);
 
-        // Resizable split: drag the divider to size the details panel.
+        let (win_w, win_h, win_max, info_w) = load_window_state();
+
+        // Resizable split: drag the divider to size the details panel. The info
+        // panel keeps its width when the window resizes (resize_end_child=false);
+        // the divider position is corrected to the saved width once realized.
         let paned = gtk4::Paned::new(Orientation::Horizontal);
         paned.set_start_child(Some(&vbox));
         paned.set_end_child(Some(&info_panel));
@@ -261,9 +269,9 @@ impl App {
         paned.set_resize_end_child(false);
         paned.set_shrink_start_child(false);
         paned.set_shrink_end_child(true);
-        paned.set_position(960);
+        paned.set_position((win_w - info_w).max(200));
         paned.set_wide_handle(true);
-        let hbox = paned;
+        let hbox = paned.clone();
 
         // ---- thumbnail grid page ----
         let grid_model = gtk4::StringList::new(&[]);
@@ -281,7 +289,6 @@ impl App {
         stack.add_named(&hbox, Some("single"));
         stack.add_named(&grid_scroll, Some("grid"));
 
-        let (win_w, win_h, win_max) = load_window_state();
         let window = ApplicationWindow::builder()
             .application(gtkapp)
             .title("winnow")
@@ -300,6 +307,8 @@ impl App {
             status,
             msg_label,
             info_panel,
+            paned,
+            info_width: Cell::new(info_w),
             info_rows,
             sort_keys,
             sort_dropdown,
@@ -333,6 +342,24 @@ impl App {
             app.apply_sort_from_ui();
         }
         app.window.present();
+
+        // Once the window has its real size, set the divider so the info panel
+        // gets its saved width (needed for restored/maximized windows, where the
+        // actual width differs from the default). resize_end_child=false then
+        // keeps that width on later window resizes.
+        {
+            let app = app.clone();
+            glib::timeout_add_local(Duration::from_millis(16), move || {
+                let pw = app.paned.width();
+                if pw > 1 {
+                    let iw = app.info_width.get().clamp(120, (pw - 200).max(120));
+                    app.paned.set_position(pw - iw);
+                    glib::ControlFlow::Break
+                } else {
+                    glib::ControlFlow::Continue
+                }
+            });
+        }
         app
     }
 
@@ -626,8 +653,13 @@ impl App {
                     session.set_index(i as isize);
                 }
                 if let Some(gtkapp) = self.window.application() {
-                    // Carry the current size to the replacement window.
-                    save_window_state(self.window.width(), self.window.height(), self.window.is_maximized());
+                    // Carry the current size + panel width to the replacement window.
+                    save_window_state(
+                        self.window.width(),
+                        self.window.height(),
+                        self.window.is_maximized(),
+                        self.info_panel.width(),
+                    );
                     App::new(&gtkapp, session, None);
                     self.window.close();
                 }
@@ -740,9 +772,15 @@ impl App {
         self.build_grid();
         self.build_header();
 
-        // Remember the window size for the next launch.
-        self.window.connect_close_request(move |win| {
-            save_window_state(win.width(), win.height(), win.is_maximized());
+        // Remember the window size and info-panel width for the next launch.
+        let app = self.clone();
+        self.window.connect_close_request(move |_win| {
+            save_window_state(
+                app.window.width(),
+                app.window.height(),
+                app.window.is_maximized(),
+                app.info_panel.width(),
+            );
             glib::Propagation::Proceed
         });
     }
