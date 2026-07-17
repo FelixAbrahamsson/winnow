@@ -474,19 +474,15 @@ impl App {
         self.set_zoom(1.0, (ww - tw) / 2.0, (wh - th) / 2.0);
     }
 
-    /// Zoom by `factor`, keeping the image point under (fx, fy) fixed.
+    /// Zoom by `factor`, keeping the image point under (fx, fy) fixed. Zooming
+    /// out can go below fit (image smaller than the viewport, centered), like
+    /// the GNOME image viewer. Use `f` / Fit to return to fill-the-window.
     fn zoom_at(&self, factor: f64, fx: f64, fy: f64) {
         let (s_old, dx_old, dy_old) = match self.view.display() {
             Some(d) => d,
             None => return,
         };
-        let fit = self.view.fit_scale().unwrap_or(0.0);
-        let lo = if fit > 0.0 { fit } else { MIN_SCALE };
-        let new = (s_old * factor).clamp(lo, MAX_SCALE);
-        if new <= fit + 1e-6 {
-            self.fit(); // zoomed back out to fit -> fill mode
-            return;
-        }
+        let new = (s_old * factor).clamp(MIN_SCALE, MAX_SCALE);
         if (new - s_old).abs() < 1e-9 {
             return;
         }
