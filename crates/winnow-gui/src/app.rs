@@ -30,6 +30,38 @@ const ZOOM_RATE: f64 = 1.1; // per unit of scroll delta (proportional)
 const KEY_ZOOM_STEP: f64 = 1.25;
 const BRIGHT_STEP: f64 = 0.1;
 const GAMMA_STEP: f64 = 0.1;
+const DEFAULT_SIZE: (i32, i32) = (1280, 820);
+
+// ---- window-size persistence (remember size across launches) -------
+fn window_state_file() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
+    Some(base.join("winnow").join("window"))
+}
+
+fn save_window_state(w: i32, h: i32, maximized: bool) {
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    if let Some(path) = window_state_file() {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(path, format!("{w} {h} {}", maximized as u8));
+    }
+}
+
+fn load_window_state() -> (i32, i32, bool) {
+    let (dw, dh) = DEFAULT_SIZE;
+    let Some(path) = window_state_file() else { return (dw, dh, false) };
+    let Ok(s) = std::fs::read_to_string(path) else { return (dw, dh, false) };
+    let mut it = s.split_whitespace();
+    let w = it.next().and_then(|x| x.parse().ok()).filter(|&v| v > 0).unwrap_or(dw);
+    let h = it.next().and_then(|x| x.parse().ok()).filter(|&v| v > 0).unwrap_or(dh);
+    let m = it.next().and_then(|x| x.parse::<u8>().ok()).map(|v| v != 0).unwrap_or(false);
+    (w, h, m)
+}
 
 /// Apply brightness/gamma to a pixbuf via a per-channel LUT. Identity fast-path.
 fn adjust_pixbuf(orig: &Pixbuf, brightness: f64, gamma: f64) -> Pixbuf {
@@ -249,13 +281,17 @@ impl App {
         stack.add_named(&hbox, Some("single"));
         stack.add_named(&grid_scroll, Some("grid"));
 
+        let (win_w, win_h, win_max) = load_window_state();
         let window = ApplicationWindow::builder()
             .application(gtkapp)
             .title("winnow")
-            .default_width(1280)
-            .default_height(820)
+            .default_width(win_w)
+            .default_height(win_h)
             .child(&stack)
             .build();
+        if win_max {
+            window.maximize();
+        }
 
         let app = Rc::new(App {
             session: RefCell::new(session),
@@ -590,6 +626,8 @@ impl App {
                     session.set_index(i as isize);
                 }
                 if let Some(gtkapp) = self.window.application() {
+                    // Carry the current size to the replacement window.
+                    save_window_state(self.window.width(), self.window.height(), self.window.is_maximized());
                     App::new(&gtkapp, session, None);
                     self.window.close();
                 }
@@ -649,6 +687,7 @@ impl App {
                 row("Ctrl+Shift+X", "Copy image file to clipboard"),
                 row("Ctrl+O", "Open a folder"),
                 row("F11", "Fullscreen"),
+                row("Esc", "Exit fullscreen, or quit"),
                 row("? / F1", "This shortcuts list"),
             ]
             .concat(),
@@ -700,6 +739,12 @@ impl App {
         self.build_info_controls();
         self.build_grid();
         self.build_header();
+
+        // Remember the window size for the next launch.
+        self.window.connect_close_request(move |win| {
+            save_window_state(win.width(), win.height(), win.is_maximized());
+            glib::Propagation::Proceed
+        });
     }
 
     fn build_header(self: &Rc<Self>) {
@@ -1074,6 +1119,14 @@ impl App {
             }
 
             match keyval {
+                gdk::Key::Escape => {
+                    // Exit fullscreen first if in it; otherwise close (quit).
+                    if app.window.is_fullscreen() {
+                        app.window.unfullscreen();
+                    } else {
+                        app.window.close();
+                    }
+                }
                 gdk::Key::Right | gdk::Key::space => {
                     app.session.borrow_mut().next();
                     app.refresh();
