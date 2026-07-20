@@ -250,6 +250,9 @@ impl App {
         info_rows.set_margin_end(8);
         let info_scroll =
             ScrolledWindow::builder().hexpand(true).vexpand(true).child(&info_rows).build();
+        // Don't let the scroll area grab the first click for focus.
+        info_scroll.set_can_focus(false);
+        info_rows.set_can_focus(false);
 
         let info_panel = gtk4::Box::new(Orientation::Vertical, 0);
         info_panel.set_width_request(200);
@@ -962,33 +965,29 @@ impl App {
             .hexpand(true)
             .selectable(true)
             .build();
-        // A single-URL value gets a LinkButton: a real button reliably activates
-        // on a single click. (A GtkLabel only follows links when the label has
-        // focus, which breaks repeat / after-navigation clicks.) Mixed text with
-        // an embedded link keeps the wrapping label.
+        // A single-URL value is shown as a link-styled label with a raw click
+        // gesture that opens it. GtkLabel/LinkButton link-following depends on
+        // the widget already having keyboard focus (so the first click just
+        // focused it); a GestureClick fires on the first click regardless.
         let pure_url = linkify && is_url(value.trim()) && !value.trim().contains(char::is_whitespace);
         if pure_url {
             let raw = value.trim();
             let uri =
                 if raw.contains("://") { raw.to_string() } else { format!("https://{raw}") };
-            let lb = gtk4::LinkButton::with_label(&uri, raw);
-            lb.set_has_frame(false);
-            lb.set_halign(gtk4::Align::Start);
-            lb.set_valign(gtk4::Align::Start);
-            if let Some(lbl) = lb.child().and_downcast::<Label>() {
-                lbl.set_wrap(true);
-                lbl.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
-                lbl.set_max_width_chars(28);
-                lbl.set_xalign(0.0);
-            }
-            lb.connect_activate_link(|b| {
-                // No parent window: gtk_show_uri with a toplevel exports its
-                // handle for the portal, which warns on X11.
-                gtk4::show_uri(None::<&gtk4::Window>, &b.uri(), 0);
-                glib::Propagation::Stop
+            v.set_selectable(false);
+            v.set_markup(&format!(
+                "<span foreground=\"#3584e4\" underline=\"single\">{}</span>",
+                glib::markup_escape_text(raw)
+            ));
+            v.set_cursor_from_name(Some("pointer"));
+            let click = GestureClick::new();
+            click.set_button(gdk::BUTTON_PRIMARY);
+            click.connect_released(move |_g, _n, _x, _y| {
+                gtk4::show_uri(None::<&gtk4::Window>, &uri, 0);
             });
+            v.add_controller(click);
             row.append(&k);
-            row.append(&lb);
+            row.append(&v);
             self.info_rows.append(&row);
             return;
         }
