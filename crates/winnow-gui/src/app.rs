@@ -965,6 +965,10 @@ impl App {
         if linkify {
             let (markup, has) = linkify_markup(value);
             if has {
+                // A *selectable* label only follows links when it already has
+                // focus (so the first click just focuses it). Non-selectable
+                // labels follow links on the first click.
+                v.set_selectable(false);
                 v.set_markup(&markup);
                 let win = self.window.clone();
                 v.connect_activate_link(move |_l, uri| {
