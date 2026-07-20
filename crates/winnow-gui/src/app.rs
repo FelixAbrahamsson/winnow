@@ -962,17 +962,43 @@ impl App {
             .hexpand(true)
             .selectable(true)
             .build();
+        // A single-URL value gets a LinkButton: a real button reliably activates
+        // on a single click. (A GtkLabel only follows links when the label has
+        // focus, which breaks repeat / after-navigation clicks.) Mixed text with
+        // an embedded link keeps the wrapping label.
+        let pure_url = linkify && is_url(value.trim()) && !value.trim().contains(char::is_whitespace);
+        if pure_url {
+            let raw = value.trim();
+            let uri =
+                if raw.contains("://") { raw.to_string() } else { format!("https://{raw}") };
+            let lb = gtk4::LinkButton::with_label(&uri, raw);
+            lb.set_has_frame(false);
+            lb.set_halign(gtk4::Align::Start);
+            lb.set_valign(gtk4::Align::Start);
+            if let Some(lbl) = lb.child().and_downcast::<Label>() {
+                lbl.set_wrap(true);
+                lbl.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+                lbl.set_max_width_chars(28);
+                lbl.set_xalign(0.0);
+            }
+            lb.connect_activate_link(|b| {
+                // No parent window: gtk_show_uri with a toplevel exports its
+                // handle for the portal, which warns on X11.
+                gtk4::show_uri(None::<&gtk4::Window>, &b.uri(), 0);
+                glib::Propagation::Stop
+            });
+            row.append(&k);
+            row.append(&lb);
+            self.info_rows.append(&row);
+            return;
+        }
+
         if linkify {
             let (markup, has) = linkify_markup(value);
             if has {
-                // A *selectable* label only follows links when it already has
-                // focus (so the first click just focuses it). Non-selectable
-                // labels follow links on the first click.
                 v.set_selectable(false);
                 v.set_markup(&markup);
-                v.connect_activate_link(move |_l, uri| {
-                    // No parent window: passing the toplevel makes gtk_show_uri
-                    // export its handle for the portal, which warns on X11.
+                v.connect_activate_link(|_l, uri| {
                     gtk4::show_uri(None::<&gtk4::Window>, uri, 0);
                     glib::Propagation::Stop
                 });
