@@ -250,8 +250,10 @@ impl App {
         info_rows.set_margin_end(8);
         let info_scroll =
             ScrolledWindow::builder().hexpand(true).vexpand(true).child(&info_rows).build();
-        // Don't let the scroll area grab the first click for focus.
+        // Don't let the scroll area grab the first click (for focus, or as a
+        // drag-to-scroll gesture that could steal a real click's press).
         info_scroll.set_can_focus(false);
+        info_scroll.set_kinetic_scrolling(false);
         info_rows.set_can_focus(false);
 
         let info_panel = gtk4::Box::new(Orientation::Vertical, 0);

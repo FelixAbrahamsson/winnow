@@ -16,7 +16,11 @@ const APP_ID: &str = "com.github.felixabrahamsson.winnow";
 const AUTO_METADATA: &[&str] = &["metadata.csv", "metadata.tsv", "metadata.json"];
 
 #[derive(Parser, Clone)]
-#[command(name = "winnow", about = "Fast keyboard-driven image culling / selection tool.")]
+#[command(
+    name = "winnow",
+    version,
+    about = "Fast keyboard-driven image culling / selection tool."
+)]
 struct Cli {
     /// Folder of images, or a single image (opens its folder, starting on it).
     folder: Option<PathBuf>,
