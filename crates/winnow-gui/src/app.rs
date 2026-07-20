@@ -970,9 +970,10 @@ impl App {
                 // labels follow links on the first click.
                 v.set_selectable(false);
                 v.set_markup(&markup);
-                let win = self.window.clone();
                 v.connect_activate_link(move |_l, uri| {
-                    gtk4::show_uri(Some(&win), uri, 0);
+                    // No parent window: passing the toplevel makes gtk_show_uri
+                    // export its handle for the portal, which warns on X11.
+                    gtk4::show_uri(None::<&gtk4::Window>, uri, 0);
                     glib::Propagation::Stop
                 });
             } else {
