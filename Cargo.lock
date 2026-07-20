@@ -977,7 +977,7 @@ dependencies = [
 
 [[package]]
 name = "winnow-core"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "csv",
  "serde",
@@ -987,7 +987,7 @@ dependencies = [
 
 [[package]]
 name = "winnow-gui"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "clap",
  "gtk4",
