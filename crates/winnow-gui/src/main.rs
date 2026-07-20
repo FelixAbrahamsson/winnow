@@ -74,10 +74,14 @@ pub fn open_target(
     metadata: Option<PathBuf>,
     buckets: Option<PathBuf>,
 ) -> Result<(Session, Option<usize>), winnow_core::buckets::BucketError> {
-    let (root, start_file) = if target.is_file() {
-        (target.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| target.to_path_buf()), Some(target.to_path_buf()))
+    // Opening a single image (e.g. as the default image viewer) scans only its
+    // directory, never recursively — recursing a large tree like $HOME is slow
+    // and unwanted when you just want to view one image and its siblings.
+    let (root, start_file, recursive) = if target.is_file() {
+        let parent = target.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| target.to_path_buf());
+        (parent, Some(target.to_path_buf()), false)
     } else {
-        (target.to_path_buf(), None)
+        (target.to_path_buf(), None, recursive)
     };
     let meta = metadata.or_else(|| AUTO_METADATA.iter().map(|n| root.join(n)).find(|p| p.exists()));
     let session = Session::new(&root, recursive, buckets.as_deref(), meta.as_deref())?;
