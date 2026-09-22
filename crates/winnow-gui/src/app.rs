@@ -1096,12 +1096,31 @@ impl App {
     }
 
     fn build_keys(self: &Rc<Self>) {
+        // Capture phase: our shortcuts must win over whatever widget has focus.
+        // In bubble phase a focused Paned divider ate Left/Right (moving the
+        // details panel), and a focused checkbox / label ate Space / arrows.
         let keys = EventControllerKey::new();
+        keys.set_propagation_phase(PropagationPhase::Capture);
         let app = self.clone();
-        keys.connect_key_pressed(move |_c, keyval, _code, state| {
+        keys.connect_key_pressed(move |c, keyval, _code, state| {
             use glib::Propagation::{Proceed, Stop};
+            // Popovers (sort dropdown list, context menu) are their own surface
+            // but still propagate through the window; leave their keys alone.
+            let own_surface = app.window.surface();
+            if c.current_event().and_then(|e| e.surface()) != own_surface {
+                return Proceed;
+            }
             let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
             let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
+            // Ctrl+C with text selected in a metadata label copies that text.
+            if ctrl && keyval == gdk::Key::c {
+                let focus = gtk4::prelude::GtkWindowExt::focus(&app.window);
+                if let Some(l) = focus.and_then(|w| w.downcast::<Label>().ok()) {
+                    if l.selection_bounds().is_some() {
+                        return Proceed;
+                    }
+                }
+            }
 
             // Grid mode: bucket keys move the selection; arrows/rubber-band are
             // left to the GridView.
