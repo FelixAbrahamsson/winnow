@@ -153,7 +153,9 @@ impl App {
         }
         let moved = self.session.borrow_mut().move_positions(&positions, bucket_idx);
         self.sync_grid_model();
+        self.update_bucket_bar();
         if moved > 0 {
+            self.flash_chip(bucket_idx);
             let (is_reject, name) = {
                 let s = self.session.borrow();
                 match s.buckets.get(bucket_idx) {

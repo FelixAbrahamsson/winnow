@@ -4,9 +4,12 @@
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use crate::buckets::{bucket_folder_names, load_buckets, Bucket, BucketError};
+use crate::buckets::{
+    bucket_folder_names, config_file, discover_buckets, load_buckets, next_free_key, save_buckets,
+    Bucket, BucketError,
+};
 use crate::metadata::{Metadata, SortKey};
-use crate::scan::scan_folder;
+use crate::scan::{is_image, scan_folder};
 
 pub struct ImageItem {
     pub abs_path: PathBuf,
@@ -95,6 +98,10 @@ pub struct Session {
     pub root: PathBuf,
     pub recursive: bool,
     pub buckets: Vec<Bucket>,
+    /// Images currently in each bucket's folder (parallel to `buckets`).
+    pub bucket_counts: Vec<usize>,
+    /// Where bucket edits are saved.
+    pub config_path: PathBuf,
     pub metadata: Metadata,
     pub items: Vec<ImageItem>,
     pub index: usize,
@@ -112,7 +119,12 @@ impl Session {
         metadata_path: Option<&Path>,
     ) -> Result<Session, BucketError> {
         let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-        let buckets = load_buckets(&root, buckets_config)?;
+        let config_path = config_file(&root, buckets_config);
+        let mut buckets = load_buckets(&root, buckets_config)?;
+        if !config_path.exists() {
+            discover_buckets(&root, &mut buckets);
+        }
+        let bucket_counts = buckets.iter().map(|b| count_images(&b.target_dir(&root))).collect();
         let metadata = match metadata_path {
             Some(p) => Metadata::load_csv(p).unwrap_or_default(),
             None => Metadata::default(),
@@ -126,6 +138,8 @@ impl Session {
             root,
             recursive,
             buckets,
+            bucket_counts,
+            config_path,
             metadata,
             items,
             index: 0,
@@ -143,6 +157,8 @@ impl Session {
             root: PathBuf::new(),
             recursive: true,
             buckets: vec![crate::buckets::default_reject()],
+            bucket_counts: vec![0],
+            config_path: PathBuf::new(),
             metadata: Metadata::default(),
             items: Vec::new(),
             index: 0,
@@ -231,6 +247,105 @@ impl Session {
         self.index = 0; // jump to the first image of the new ordering
     }
 
+    // ---- bucket editing --------------------------------------------
+    fn bump_count(&mut self, bucket_name: &str, delta: isize) {
+        if let Some(i) = self.bucket_index_by_name(bucket_name) {
+            self.bucket_counts[i] = self.bucket_counts[i].saturating_add_signed(delta);
+        }
+    }
+
+    fn check_name(&self, name: &str, except: Option<usize>) -> Result<String, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("Bucket name is empty".into());
+        }
+        if name.starts_with('.') || name.contains(['/', '\\']) {
+            return Err(format!("“{name}” can't be used as a folder name"));
+        }
+        let taken = self.buckets.iter().enumerate().any(|(i, b)| {
+            Some(i) != except
+                && (b.name.eq_ignore_ascii_case(name) || b.folder.eq_ignore_ascii_case(&format!("_{name}")))
+        });
+        if taken {
+            return Err(format!("A bucket named “{name}” already exists"));
+        }
+        Ok(name.to_string())
+    }
+
+    fn save_buckets(&self) -> Result<(), String> {
+        save_buckets(&self.config_path, &self.buckets)
+            .map_err(|e| format!("Couldn't save {}: {e}", self.config_path.display()))
+    }
+
+    /// Add a bucket `name` (folder `_name`, next free digit hotkey) and save
+    /// the config. Images already inside that folder leave the queue.
+    pub fn add_bucket(&mut self, name: &str) -> Result<usize, String> {
+        if self.root.as_os_str().is_empty() {
+            return Err("Open a folder first".into());
+        }
+        let name = self.check_name(name, None)?;
+        let bucket =
+            Bucket { key: next_free_key(&self.buckets), folder: format!("_{name}"), name, is_reject: false };
+        let dir = bucket.target_dir(&self.root);
+        let before = self.items.len();
+        self.items.retain(|it| !it.abs_path.starts_with(&dir));
+        if self.items.len() != before {
+            self.clamp_index();
+        }
+        self.bucket_counts.push(count_images(&dir));
+        self.buckets.push(bucket);
+        self.save_buckets()?;
+        Ok(self.buckets.len() - 1)
+    }
+
+    /// Rename a category bucket. Its folder is renamed too when it follows the
+    /// `_name` convention; pending undo/redo steps are pointed at the new
+    /// folder.
+    pub fn rename_bucket(&mut self, idx: usize, new_name: &str) -> Result<(), String> {
+        match self.buckets.get(idx) {
+            Some(b) if !b.is_reject => {}
+            _ => return Err("That bucket can't be renamed".into()),
+        }
+        let new_name = self.check_name(new_name, Some(idx))?;
+        let old = self.buckets[idx].clone();
+        let mut new = old.clone();
+        new.name = new_name;
+        if old.folder == format!("_{}", old.name) {
+            new.folder = format!("_{}", new.name);
+            let (from, to) = (old.target_dir(&self.root), new.target_dir(&self.root));
+            if to.exists() {
+                return Err(format!("{} already exists", to.display()));
+            }
+            if from.exists() {
+                std::fs::rename(&from, &to).map_err(|e| format!("Couldn't rename folder: {e}"))?;
+            }
+            for op in self.undo_stack.iter_mut().chain(self.redo_stack.iter_mut()) {
+                if let Ok(rest) = op.to_abs.strip_prefix(&from) {
+                    op.to_abs = to.join(rest);
+                }
+            }
+        }
+        for op in self.undo_stack.iter_mut().chain(self.redo_stack.iter_mut()) {
+            if op.bucket_name == old.name {
+                op.bucket_name = new.name.clone();
+            }
+        }
+        self.buckets[idx] = new;
+        self.save_buckets()
+    }
+
+    /// Drop a category bucket from the config. Its folder and files are left
+    /// untouched (they rejoin the queue the next time the folder is opened).
+    pub fn remove_bucket(&mut self, idx: usize) -> Result<(), String> {
+        match self.buckets.get(idx) {
+            Some(b) if !b.is_reject => {}
+            _ => return Err("That bucket can't be removed".into()),
+        }
+        self.buckets.remove(idx);
+        self.bucket_counts.remove(idx);
+        self.save_buckets()
+    }
+
     // ---- move / undo engine ---------------------------------------
     pub fn bucket_index_by_name(&self, name: &str) -> Option<usize> {
         self.buckets.iter().position(|b| b.name == name)
@@ -244,6 +359,7 @@ impl Session {
             return None;
         }
         let item = self.items.remove(item_pos);
+        self.bucket_counts[bucket_idx] += 1;
         Some(MoveOp {
             from_abs: item.abs_path.clone(),
             to_abs: dest,
@@ -300,6 +416,7 @@ impl Session {
             self.undo_stack.push(op);
             return None;
         }
+        self.bump_count(&op.bucket_name, -1);
         let mut item = op.item;
         item.abs_path = restore;
         let name = item.name();
@@ -331,6 +448,7 @@ impl Session {
         let item = self.items.remove(pos);
         let name = item.name();
         let bucket_name = op.bucket_name.clone();
+        self.bump_count(&bucket_name, 1);
         self.undo_stack.push(MoveOp {
             from_abs: op.from_abs,
             to_abs: dest,
@@ -343,9 +461,22 @@ impl Session {
     }
 }
 
+/// Number of image files anywhere under `dir` (0 if it doesn't exist).
+fn count_images(dir: &Path) -> usize {
+    if !dir.is_dir() {
+        return 0;
+    }
+    walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file() && is_image(e.path()))
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buckets::CONFIG_NAME;
     use std::fs;
 
     fn make_session(n: usize) -> (PathBuf, Session) {
@@ -420,6 +551,110 @@ mod tests {
         assert_eq!(s.index, 2);
         s.jump(-10);
         assert_eq!(s.index, 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn tmp_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("winnow-model-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn existing_bucket_folders_are_discovered_counted_and_skipped() {
+        let root = tmp_root("disc");
+        fs::create_dir_all(root.join("_crack/sub")).unwrap();
+        fs::write(root.join("_crack/sub/a.jpg"), b"x").unwrap();
+        fs::write(root.join("_crack/b.png"), b"x").unwrap();
+        fs::write(root.join("todo.jpg"), b"x").unwrap();
+        let s = Session::new(&root, true, None, None).unwrap();
+        assert_eq!(s.buckets[1].name, "crack");
+        assert_eq!(s.buckets[1].key, "1");
+        assert_eq!(s.bucket_counts, vec![0, 2]);
+        assert_eq!(s.count(), 1); // only todo.jpg is left to sort
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn config_disables_discovery() {
+        let root = tmp_root("cfg");
+        fs::create_dir_all(root.join("_cache")).unwrap();
+        fs::write(root.join(CONFIG_NAME), "").unwrap();
+        let s = Session::new(&root, true, None, None).unwrap();
+        assert_eq!(s.buckets.len(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn add_move_undo_updates_counts_and_config() {
+        let root = tmp_root("add");
+        for i in 0..3 {
+            fs::write(root.join(format!("img_{i}.jpg")), b"x").unwrap();
+        }
+        let mut s = Session::new(&root, true, None, None).unwrap();
+        assert!(s.add_bucket("  ").is_err());
+        let i = s.add_bucket("crack").unwrap();
+        assert!(s.add_bucket("Crack").is_err());
+        assert_eq!(s.buckets[i].key, "1");
+        assert_eq!(load_buckets(&root, None).unwrap(), s.buckets);
+
+        s.move_current_to(i).unwrap();
+        assert_eq!(s.bucket_counts[i], 1);
+        s.undo().unwrap();
+        assert_eq!(s.bucket_counts[i], 0);
+        s.redo().unwrap();
+        assert_eq!(s.bucket_counts[i], 1);
+        assert!(root.join("_crack/img_0.jpg").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn adding_bucket_over_existing_folder_pulls_its_images_from_queue() {
+        let root = tmp_root("addex");
+        fs::write(root.join(CONFIG_NAME), "").unwrap(); // no discovery
+        fs::create_dir_all(root.join("_spall")).unwrap();
+        fs::write(root.join("_spall/a.jpg"), b"x").unwrap();
+        fs::write(root.join("b.jpg"), b"x").unwrap();
+        let mut s = Session::new(&root, true, None, None).unwrap();
+        assert_eq!(s.count(), 2);
+        let i = s.add_bucket("spall").unwrap();
+        assert_eq!(s.count(), 1);
+        assert_eq!(s.bucket_counts[i], 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rename_moves_folder_and_keeps_undo_working() {
+        let root = tmp_root("ren");
+        fs::write(root.join("a.jpg"), b"x").unwrap();
+        let mut s = Session::new(&root, true, None, None).unwrap();
+        let i = s.add_bucket("crak").unwrap();
+        s.move_current_to(i).unwrap();
+        s.rename_bucket(i, "crack").unwrap();
+        assert!(root.join("_crack/a.jpg").exists());
+        assert!(!root.join("_crak").exists());
+        assert!(s.rename_bucket(0, "nope").is_err());
+        s.undo().unwrap();
+        assert!(root.join("a.jpg").exists());
+        assert_eq!(s.bucket_counts[i], 0);
+        assert_eq!(load_buckets(&root, None).unwrap()[1].name, "crack");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remove_keeps_files_and_updates_config() {
+        let root = tmp_root("rm");
+        fs::write(root.join("a.jpg"), b"x").unwrap();
+        let mut s = Session::new(&root, true, None, None).unwrap();
+        let i = s.add_bucket("x").unwrap();
+        s.move_current_to(i).unwrap();
+        assert!(s.remove_bucket(0).is_err());
+        s.remove_bucket(i).unwrap();
+        assert_eq!(s.buckets.len(), 1);
+        assert_eq!(s.bucket_counts.len(), 1);
+        assert!(root.join("_x/a.jpg").exists());
+        assert_eq!(load_buckets(&root, None).unwrap().len(), 1);
         let _ = fs::remove_dir_all(&root);
     }
 }

@@ -115,7 +115,7 @@ list at any time.
 | `PgDn` / `PgUp` | Jump ±10 |
 | `Home` / `End` | First / last |
 | `Delete` / `Backspace` / `X` | Reject (move to `_rejected/`) |
-| *bucket keys* | Move to that category (configurable) |
+| *bucket keys* / click a chip | Move to that bucket |
 | `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo the last move |
 | scroll wheel / pinch | Zoom in / out (toward cursor) |
 | `+` / `-` | Zoom in / out |
@@ -147,16 +147,35 @@ on, each new image gets the brightness that makes it look as bright (same mean
 displayed luminance) as the previous image did — handy when exposure swings
 between captures. Tune the brightness once, then step through; gamma is kept.
 
-## Buckets (optional categories)
+## Buckets (sorting into classes)
 
-With **no config**, you get plain keep/reject. To add categories, drop an
-`.winnow.toml` in the image folder (or pass `--buckets FILE`):
+Each bucket is a folder + a hotkey. Pressing the key (or clicking the bucket's
+chip in the bar under the image) moves the current image — or, in grid view,
+all selected images — into that folder, preserving subfolder structure, fully
+undoable. Out of the box there is just **reject** (`Delete` → `_rejected/`).
+
+**The bucket bar** shows every bucket as a chip: hotkey, name, and how many
+images are in it. The chip flashes when you press its key.
+
+- **Add** a bucket with the `+` chip: type a name and it gets folder `_name/`
+  and the next free digit key `1`–`9`.
+- **Rename / remove** a bucket by right-clicking its chip. Renaming also
+  renames its folder. Removing only forgets the bucket — its folder and images
+  stay put (and rejoin the queue the next time you open the folder).
+- **Resuming:** with no config file, existing `_name/` folders in the image
+  folder are picked up as buckets automatically, so a half-done sort carries on
+  where it left off; images already in them are left out of the queue.
+
+Bucket edits are saved to `.winnow.toml` in the image folder (or the file given
+with `--buckets FILE`). Once that file exists it is the source of truth — no
+more auto-discovery — and you can edit it by hand too (comments aren't kept
+when winnow rewrites it):
 
 ```toml
-# optional: override the built-in reject bucket
 [reject]
-folder = "_rejected"
+name = "reject"
 key = "Delete"
+folder = "_rejected"
 
 [[bucket]]
 name = "crack"
@@ -164,19 +183,12 @@ key = "1"
 folder = "_crack"
 
 [[bucket]]
-name = "corrosion"
-key = "2"
-folder = "_corrosion"
-
-[[bucket]]
 name = "spall"
-key = "3"
+key = "2"
 folder = "_spall"
 ```
 
-Each bucket is a folder + a hotkey. Pressing the key moves the current image
-(or, in grid view, all selected images) into that folder, preserving subfolder
-structure, fully undoable. Recommended hotkeys: digits `1`–`9`.
+An empty `key = ""` means the bucket has no hotkey (click its chip instead).
 
 ## Metadata format
 

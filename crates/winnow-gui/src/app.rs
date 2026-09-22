@@ -1,6 +1,7 @@
 //! The winnow application: an `App` struct owning the session, widgets, and
 //! view state, with methods wired to GTK event controllers.
 
+mod bucketbar;
 pub mod desktop;
 mod grid;
 
@@ -126,6 +127,8 @@ pub struct App {
     sort_dropdown: gtk4::DropDown,
     desc_check: gtk4::CheckButton,
     stack: gtk4::Stack,
+    bucket_bar: gtk4::FlowBox,
+    bucket_chips: RefCell<Vec<bucketbar::Chip>>,
     grid_view: gtk4::GridView,
     grid_model: gtk4::StringList,
     grid_selection: gtk4::MultiSelection,
@@ -246,7 +249,16 @@ impl App {
 
         let vbox = gtk4::Box::new(Orientation::Vertical, 0);
         vbox.append(&view);
-        vbox.append(&status_bar);
+
+        // Bucket chips (key, name, count) — shown under both views.
+        let bucket_bar = gtk4::FlowBox::new();
+        bucket_bar.set_selection_mode(gtk4::SelectionMode::None);
+        bucket_bar.set_max_children_per_line(64);
+        bucket_bar.set_column_spacing(4);
+        bucket_bar.set_row_spacing(4);
+        bucket_bar.set_margin_start(8);
+        bucket_bar.set_margin_end(8);
+        bucket_bar.set_margin_top(4);
 
         // ---- info / sort side panel ----
         let sort_keys: Vec<(String, String)> = session.sortable_keys();
@@ -312,12 +324,17 @@ impl App {
         stack.add_named(&hbox, Some("single"));
         stack.add_named(&grid_scroll, Some("grid"));
 
+        let root = gtk4::Box::new(Orientation::Vertical, 0);
+        root.append(&stack);
+        root.append(&bucket_bar);
+        root.append(&status_bar);
+
         let window = ApplicationWindow::builder()
             .application(gtkapp)
             .title("winnow")
             .default_width(win_w)
             .default_height(win_h)
-            .child(&stack)
+            .child(&root)
             .build();
         if win_max {
             window.maximize();
@@ -337,6 +354,8 @@ impl App {
             sort_dropdown,
             desc_check,
             stack,
+            bucket_bar,
+            bucket_chips: RefCell::new(Vec::new()),
             grid_view,
             grid_model,
             grid_selection,
@@ -620,7 +639,9 @@ impl App {
     fn move_to_bucket(self: &Rc<Self>, idx: usize) {
         let msg = self.session.borrow_mut().move_current_to(idx);
         self.refresh();
+        self.update_bucket_bar();
         if let Some(m) = msg {
+            self.flash_chip(idx);
             self.flash(m);
         }
     }
@@ -628,6 +649,7 @@ impl App {
     fn undo(self: &Rc<Self>) {
         let msg = self.session.borrow_mut().undo();
         self.refresh();
+        self.update_bucket_bar();
         if let Some(m) = msg {
             self.flash(m);
         }
@@ -636,6 +658,7 @@ impl App {
     fn redo(self: &Rc<Self>) {
         let msg = self.session.borrow_mut().redo();
         self.refresh();
+        self.update_bucket_bar();
         if let Some(m) = msg {
             self.flash(m);
         }
@@ -753,12 +776,15 @@ impl App {
             if b.is_reject {
                 buckets.push_str(&row("Delete / Backspace / x", "Reject → move to _rejected/"));
             } else {
+                let key = if b.key.is_empty() { "(click its chip)" } else { &b.key };
                 buckets.push_str(&row(
-                    &glib::markup_escape_text(&b.key),
+                    &glib::markup_escape_text(key),
                     &format!("Move to “{}” ({}/)", b.name, b.folder),
                 ));
             }
         }
+        buckets.push_str(&row("Bucket bar", "Click a chip to move · + adds a bucket"));
+        buckets.push_str(&row("Right-click a chip", "Rename / remove that bucket"));
         format!(
             "<b>Navigation</b>\n{nav}\n<b>Sort into buckets</b>\n{buckets}{undo}\n\
              <b>Zoom &amp; pan</b>\n{zoom}\n<b>Image adjust</b>\n{adjust}\n\
@@ -839,6 +865,7 @@ impl App {
 
     // ---- event controllers ----------------------------------------
     fn build_controllers(self: &Rc<Self>) {
+        self.build_bucket_bar();
         self.build_keys();
         self.build_scroll();
         self.build_mouse();
@@ -1129,16 +1156,30 @@ impl App {
         popover.set_has_arrow(false);
         popover.set_halign(gtk4::Align::Start);
 
+        // Rebuilt on every open so bucket edits show up.
+        let click = GestureClick::new();
+        click.set_button(gdk::BUTTON_SECONDARY);
+        let app = self.clone();
+        click.connect_pressed(move |_g, _n, x, y| {
+            popover.set_child(Some(&app.context_menu_content(&popover)));
+            popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover.popup();
+        });
+        self.view.add_controller(click);
+    }
+
+    fn context_menu_content(self: &Rc<Self>, popover: &gtk4::Popover) -> gtk4::Box {
         let vbox = gtk4::Box::new(Orientation::Vertical, 0);
         vbox.set_width_request(240);
 
         let mut items: Vec<(String, Option<MenuAction>)> =
             vec![("Next  →".into(), Some(MenuAction::Next)), ("Previous  ←".into(), Some(MenuAction::Prev)), (String::new(), None)];
         for (i, b) in self.session.borrow().buckets.iter().enumerate() {
+            let key = if b.key.is_empty() { String::new() } else { format!("  ({})", b.key) };
             let label = if b.is_reject {
-                format!("Reject  ({})", b.key)
+                format!("Reject{key}")
             } else {
-                format!("Move to “{}”  ({})", b.name, b.key)
+                format!("Move to “{}”{key}", b.name)
             };
             items.push((label, Some(MenuAction::Bucket(i))));
         }
@@ -1171,15 +1212,7 @@ impl App {
                 }
             }
         }
-        popover.set_child(Some(&vbox));
-
-        let click = GestureClick::new();
-        click.set_button(gdk::BUTTON_SECONDARY);
-        click.connect_pressed(move |_g, _n, x, y| {
-            popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-            popover.popup();
-        });
-        self.view.add_controller(click);
+        vbox
     }
 
     fn build_keys(self: &Rc<Self>) {
