@@ -128,6 +128,7 @@ list at any time.
 | `Ctrl+Shift+X` | Copy image file — paste into a file manager |
 | `[` / `]` / `\` | Brightness down / up / reset |
 | `{` / `}` | Gamma down / up |
+| `B` | Toggle auto brightness (match the previous image's look) |
 | `Ctrl+C` / `Ctrl+Shift+C` | Copy filename / full path |
 | `G` | Toggle grid ↔ single view |
 | `I` | Toggle info panel |
@@ -140,6 +141,11 @@ In grid view, select multiple thumbnails (click / `Ctrl`+click / `Shift`+click)
 and press a bucket key to move them all at once.
 
 Changing the sort key jumps you to the first image of the new order.
+
+**Auto brightness** (`B`, or the checkbox in the ☀ Brightness popover): when
+on, each new image gets the brightness that makes it look as bright (same mean
+displayed luminance) as the previous image did — handy when exposure swings
+between captures. Tune the brightness once, then step through; gamma is kept.
 
 ## Buckets (optional categories)
 

@@ -7,6 +7,7 @@ pub mod buckets;
 pub mod metadata;
 pub mod model;
 pub mod scan;
+pub mod tone;
 
 pub use buckets::{Bucket, CONFIG_NAME};
 pub use metadata::{Metadata, SortKey};

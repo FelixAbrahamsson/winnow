@@ -20,6 +20,7 @@ use gtk4::{
     EventControllerScrollFlags, GestureClick, GestureDrag, Label, Orientation, PropagationPhase,
     ScrolledWindow,
 };
+use winnow_core::tone::{self, Histogram};
 use winnow_core::Session;
 
 use crate::imageview::ImageView;
@@ -63,6 +64,14 @@ fn load_window_state() -> (i32, i32, bool, i32) {
     let m = it.next().and_then(|x| x.parse::<u8>().ok()).map(|v| v != 0).unwrap_or(false);
     let info = it.next().and_then(|x| x.parse().ok()).filter(|&v| v > 0).unwrap_or(DEFAULT_INFO_WIDTH);
     (w, h, m, info)
+}
+
+/// Luminance histogram of a pixbuf, sampling down to ~250k pixels.
+fn histogram(pb: &Pixbuf) -> Histogram {
+    let (w, h) = (pb.width() as usize, pb.height() as usize);
+    let step = ((w * h) as f64 / 250_000.0).sqrt().ceil().max(1.0) as usize;
+    let data = pb.read_pixel_bytes();
+    tone::luminance_histogram(&data, w, h, pb.rowstride() as usize, pb.n_channels() as usize, step)
 }
 
 /// Apply brightness/gamma to a pixbuf via a per-channel LUT. Identity fast-path.
@@ -128,6 +137,15 @@ pub struct App {
     open_dialog: RefCell<Option<gtk4::FileChooserNative>>,
     brightness: Cell<f64>,
     gamma: Cell<f64>,
+    // Auto-brightness: match each new image's displayed mean to the last one.
+    auto_bright: Cell<bool>,
+    auto_check: RefCell<Option<gtk4::CheckButton>>,
+    cur_hist: RefCell<Option<Histogram>>,
+    // Header sliders, kept in sync with key/auto changes; `syncing` stops the
+    // programmatic set_value from feeding back into set_brightness/gamma.
+    bri_scale: RefCell<Option<gtk4::Scale>>,
+    gam_scale: RefCell<Option<gtk4::Scale>>,
+    syncing: Cell<bool>,
     msg_gen: Cell<u64>,
     pan_start: Cell<(f64, f64)>,
     pan_active: Cell<bool>,
@@ -330,6 +348,12 @@ impl App {
             open_dialog: RefCell::new(None),
             brightness: Cell::new(1.0),
             gamma: Cell::new(1.0),
+            auto_bright: Cell::new(false),
+            auto_check: RefCell::new(None),
+            cur_hist: RefCell::new(None),
+            bri_scale: RefCell::new(None),
+            gam_scale: RefCell::new(None),
+            syncing: Cell::new(false),
             msg_gen: Cell::new(0),
             pan_start: Cell::new((0.0, 0.0)),
             pan_active: Cell::new(false),
@@ -373,10 +397,16 @@ impl App {
         let path = self.session.borrow().current().map(|i| i.abs_path.clone());
         match path {
             Some(p) => {
+                let same_image = *self.cur_path.borrow() == p;
                 *self.cur_path.borrow_mut() = p.clone();
                 match Pixbuf::from_file(&p) {
                     Ok(pb) => {
                         let pb = pb.apply_embedded_orientation().unwrap_or(pb);
+                        let hist = histogram(&pb);
+                        if self.auto_bright.get() && !same_image {
+                            self.auto_match(&hist);
+                        }
+                        *self.cur_hist.borrow_mut() = Some(hist);
                         *self.orig_pixbuf.borrow_mut() = Some(pb);
                         // New image starts fitted (so it fills the viewport).
                         self.view.set_fitted(true);
@@ -385,6 +415,7 @@ impl App {
                     }
                     Err(_) => {
                         *self.orig_pixbuf.borrow_mut() = None;
+                        *self.cur_hist.borrow_mut() = None;
                         self.view.set_texture(None);
                     }
                 }
@@ -514,23 +545,31 @@ impl App {
     // ---- brightness -----------------------------------------------
     fn bump_brightness(self: &Rc<Self>, delta: f64) {
         self.brightness.set((self.brightness.get() + delta).clamp(0.1, 5.0));
+        self.sync_sliders();
         self.render();
         self.flash(format!("Brightness {:.0}%", self.brightness.get() * 100.0));
     }
 
     // Absolute setters used by the header-bar sliders (no status flash).
     fn set_brightness(&self, v: f64) {
+        if self.syncing.get() {
+            return;
+        }
         self.brightness.set(v.clamp(0.1, 5.0));
         self.render();
     }
 
     fn set_gamma(&self, v: f64) {
+        if self.syncing.get() {
+            return;
+        }
         self.gamma.set(v.clamp(0.1, 5.0));
         self.render();
     }
 
     fn bump_gamma(self: &Rc<Self>, delta: f64) {
         self.gamma.set((self.gamma.get() + delta).clamp(0.1, 5.0));
+        self.sync_sliders();
         self.render();
         self.flash(format!("Gamma {:.2}", self.gamma.get()));
     }
@@ -538,8 +577,43 @@ impl App {
     fn reset_adjustments(self: &Rc<Self>) {
         self.brightness.set(1.0);
         self.gamma.set(1.0);
+        self.sync_sliders();
         self.render();
         self.flash("Reset brightness & gamma".into());
+    }
+
+    /// Reflect the current brightness/gamma in the header sliders without
+    /// re-triggering their handlers.
+    fn sync_sliders(&self) {
+        self.syncing.set(true);
+        if let Some(s) = self.bri_scale.borrow().as_ref() {
+            s.set_value(self.brightness.get());
+        }
+        if let Some(s) = self.gam_scale.borrow().as_ref() {
+            s.set_value(self.gamma.get());
+        }
+        self.syncing.set(false);
+    }
+
+    /// Pick the brightness that shows the new image (`hist`) at the same mean
+    /// luminance the previous image was displayed at. Gamma is left alone.
+    fn auto_match(&self, hist: &Histogram) {
+        let (b, g) = (self.brightness.get(), self.gamma.get());
+        let target = self.cur_hist.borrow().as_ref().and_then(|h| tone::displayed_mean(h, b, g));
+        if let Some(nb) = target.and_then(|t| tone::match_brightness(hist, g, t)) {
+            self.brightness.set(nb);
+            self.sync_sliders();
+        }
+    }
+
+    fn set_auto_brightness(self: &Rc<Self>, on: bool) {
+        if self.auto_bright.replace(on) == on {
+            return;
+        }
+        if let Some(c) = self.auto_check.borrow().as_ref() {
+            c.set_active(on);
+        }
+        self.flash(format!("Auto brightness {}", if on { "on" } else { "off" }));
     }
 
     // ---- buckets / undo -------------------------------------------
@@ -712,6 +786,7 @@ impl App {
                 row("] / [", "Brightness up / down"),
                 row("} / {", "Gamma up / down"),
                 row("\\", "Reset brightness & gamma"),
+                row("b", "Toggle auto brightness (match previous image)"),
             ]
             .concat(),
             files = [
@@ -836,6 +911,14 @@ impl App {
             let app = self.clone();
             gam_scale.connect_value_changed(move |s| app.set_gamma(s.value()));
         }
+        let auto = gtk4::CheckButton::with_label("Auto (match previous image)");
+        auto.set_tooltip_text(Some(
+            "Set each new image's brightness so it looks as bright as the last one (B)",
+        ));
+        {
+            let app = self.clone();
+            auto.connect_toggled(move |c| app.set_auto_brightness(c.is_active()));
+        }
         let reset = gtk4::Button::with_label("Reset");
         {
             let bri = bri_scale.clone();
@@ -851,7 +934,11 @@ impl App {
         pbox.append(&bri_scale);
         pbox.append(&gl);
         pbox.append(&gam_scale);
+        pbox.append(&auto);
         pbox.append(&reset);
+        *self.bri_scale.borrow_mut() = Some(bri_scale.clone());
+        *self.gam_scale.borrow_mut() = Some(gam_scale.clone());
+        *self.auto_check.borrow_mut() = Some(auto);
         pop.set_child(Some(&pbox));
         bri_btn.set_popover(Some(&pop));
         header.pack_start(&bri_btn);
@@ -1248,6 +1335,7 @@ impl App {
                 gdk::Key::backslash => app.reset_adjustments(),
                 gdk::Key::F11 => app.toggle_fullscreen(),
                 gdk::Key::i => app.toggle_info(),
+                gdk::Key::b => app.set_auto_brightness(!app.auto_bright.get()),
                 gdk::Key::g => app.toggle_view(),
                 gdk::Key::question | gdk::Key::F1 => app.show_help(),
                 _ => return Proceed,
