@@ -75,19 +75,16 @@ fn histogram(pb: &Pixbuf) -> Histogram {
     tone::luminance_histogram(&data, w, h, pb.rowstride() as usize, pb.n_channels() as usize, step)
 }
 
-/// Apply brightness/gamma to a pixbuf via a per-channel LUT. Identity fast-path.
-fn adjust_pixbuf(orig: &Pixbuf, brightness: f64, gamma: f64) -> Pixbuf {
-    if (brightness - 1.0).abs() < 1e-3 && (gamma - 1.0).abs() < 1e-3 {
+/// Apply gamma to a pixbuf via a per-channel LUT. Identity fast-path.
+/// (Brightness is a plain multiply, applied on the GPU by the view.)
+fn gamma_pixbuf(orig: &Pixbuf, gamma: f64) -> Pixbuf {
+    if (gamma - 1.0).abs() < 1e-3 {
         return orig.clone();
     }
     let mut lut = [0u8; 256];
     for (i, l) in lut.iter_mut().enumerate() {
-        let mut v = i as f64 / 255.0;
-        if (gamma - 1.0).abs() >= 1e-3 {
-            v = v.powf(1.0 / gamma.max(0.05));
-        }
-        v = (v * brightness).clamp(0.0, 1.0);
-        *l = (v * 255.0).round() as u8;
+        let v = (i as f64 / 255.0).powf(1.0 / gamma.max(0.05));
+        *l = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
     }
     let n = orig.n_channels() as usize;
     let rowstride = orig.rowstride() as usize;
@@ -448,13 +445,21 @@ impl App {
         self.update_info();
     }
 
-    /// Re-apply brightness/gamma to the current image (keeps zoom/pan).
+    /// Rebuild the texture with the current gamma (keeps zoom/pan). Costly on
+    /// big images, so only for a new image or a gamma change.
     fn render(&self) {
         if let Some(orig) = self.orig_pixbuf.borrow().as_ref() {
-            let adj = adjust_pixbuf(orig, self.brightness.get(), self.gamma.get());
+            let adj = gamma_pixbuf(orig, self.gamma.get());
             let tex = gdk::Texture::for_pixbuf(&adj);
             self.view.set_texture(Some(tex));
         }
+        self.apply_brightness();
+    }
+
+    /// Brightness is applied by the view at draw time — cheap enough to
+    /// follow every scroll event.
+    fn apply_brightness(&self) {
+        self.view.set_brightness(self.brightness.get());
     }
 
     // ---- status bar -----------------------------------------------
@@ -565,7 +570,7 @@ impl App {
     fn bump_brightness(self: &Rc<Self>, delta: f64) {
         self.brightness.set((self.brightness.get() + delta).clamp(0.1, 5.0));
         self.sync_sliders();
-        self.render();
+        self.apply_brightness();
         self.flash(format!("Brightness {:.0}%", self.brightness.get() * 100.0));
     }
 
@@ -575,7 +580,7 @@ impl App {
             return;
         }
         self.brightness.set(v.clamp(0.1, 5.0));
-        self.render();
+        self.apply_brightness();
     }
 
     fn set_gamma(&self, v: f64) {
@@ -809,7 +814,7 @@ impl App {
             ]
             .concat(),
             adjust = [
-                row("] / [", "Brightness up / down"),
+                row("Ctrl + scroll", "Brightness up / down"),
                 row("} / {", "Gamma up / down"),
                 row("\\", "Reset brightness & gamma"),
                 row("b", "Toggle auto brightness (match previous image)"),
@@ -1361,8 +1366,6 @@ impl App {
                 gdk::Key::minus => app.zoom(1.0 / KEY_ZOOM_STEP),
                 gdk::Key::f => app.fit(),
                 gdk::Key::a => app.actual_size(),
-                gdk::Key::bracketright => app.bump_brightness(BRIGHT_STEP),
-                gdk::Key::bracketleft => app.bump_brightness(-BRIGHT_STEP),
                 gdk::Key::braceright => app.bump_gamma(GAMMA_STEP),
                 gdk::Key::braceleft => app.bump_gamma(-GAMMA_STEP),
                 gdk::Key::backslash => app.reset_adjustments(),
@@ -1391,7 +1394,12 @@ impl App {
         scroll.set_propagation_phase(PropagationPhase::Capture);
         {
             let app = self.clone();
-            scroll.connect_scroll(move |_c, _dx, dy| {
+            scroll.connect_scroll(move |c, _dx, dy| {
+                // Ctrl+scroll adjusts brightness (wheel up = brighter).
+                if c.current_event_state().contains(gdk::ModifierType::CONTROL_MASK) {
+                    app.bump_brightness(-dy * BRIGHT_STEP);
+                    return glib::Propagation::Stop;
+                }
                 let (px, py) = app.pointer.get();
                 app.zoom_at(ZOOM_RATE.powf(-dy), px, py);
                 glib::Propagation::Stop

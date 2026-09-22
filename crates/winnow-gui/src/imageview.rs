@@ -20,6 +20,7 @@ mod imp {
         pub scale: Cell<f64>,         // display scale when not fitted
         pub offset: Cell<(f64, f64)>, // image top-left in widget coords (not fitted)
         pub fitted: Cell<bool>,
+        pub brightness: Cell<f64>, // RGB multiplier applied at draw time
     }
 
     #[glib::object_subclass]
@@ -34,6 +35,7 @@ mod imp {
             self.parent_constructed();
             self.scale.set(1.0);
             self.fitted.set(true);
+            self.brightness.set(1.0);
         }
     }
 
@@ -60,7 +62,23 @@ mod imp {
             };
             // Clip to the widget so the image never overdraws siblings.
             snapshot.push_clip(&graphene::Rect::new(0.0, 0.0, ww, wh));
+            // Brightness as a GPU color matrix (output is clamped to [0, 1]),
+            // so changing it never re-processes the pixels.
+            let b = self.brightness.get() as f32;
+            let adjust = (b - 1.0).abs() > 1e-3;
+            if adjust {
+                let m = graphene::Matrix::from_float([
+                    b, 0.0, 0.0, 0.0, //
+                    0.0, b, 0.0, 0.0, //
+                    0.0, 0.0, b, 0.0, //
+                    0.0, 0.0, 0.0, 1.0,
+                ]);
+                snapshot.push_color_matrix(&m, &graphene::Vec4::zero());
+            }
             snapshot.append_texture(&tex, &graphene::Rect::new(dx, dy, dw, dh));
+            if adjust {
+                snapshot.pop();
+            }
             snapshot.pop();
         }
     }
@@ -84,6 +102,12 @@ impl ImageView {
     pub fn set_texture(&self, t: Option<gdk::Texture>) {
         *self.imp().texture.borrow_mut() = t;
         self.queue_draw();
+    }
+
+    pub fn set_brightness(&self, b: f64) {
+        if (self.imp().brightness.replace(b) - b).abs() > f64::EPSILON {
+            self.queue_draw();
+        }
     }
 
     pub fn texture(&self) -> Option<gdk::Texture> {

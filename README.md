@@ -126,7 +126,8 @@ list at any time.
 | left-drag **when fit** | Drag the file out to another app (copy) |
 | `Ctrl`+left-drag | Drag the file out (works even when zoomed) |
 | `Ctrl+Shift+X` | Copy image file — paste into a file manager |
-| `[` / `]` / `\` | Brightness down / up / reset |
+| `Ctrl` + scroll wheel | Brightness up / down |
+| `\` | Reset brightness & gamma |
 | `{` / `}` | Gamma down / up |
 | `B` | Toggle auto brightness (match the previous image's look) |
 | `Ctrl+C` / `Ctrl+Shift+C` | Copy filename / full path |
