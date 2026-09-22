@@ -192,14 +192,17 @@ An empty `key = ""` means the bucket has no hotkey (click its chip instead).
 
 ## Metadata format
 
-If a `metadata.csv` (or `.tsv`/`.json`/`.jsonl`/`.parquet`) sits in the image
-folder, it is loaded automatically — no `--metadata` flag needed. Use
-`--metadata FILE` only to point at one elsewhere.
+If a `metadata.csv` (or tab-separated `metadata.tsv`) sits in the image folder,
+it is loaded automatically — no `--metadata` flag needed. Use
+`--metadata FILE` only to point at one elsewhere. (JSON / Parquet are not
+supported.)
 
 A `metadata.csv` with one row per image is the recommended format. It must have
-a column identifying the image — `path`, `file`, `filename`, `image`, or `name`
-— holding the path **relative to the folder root** (e.g. `sub/img_0007.jpg`), so
-it works with recursion. Any other columns become sortable/displayable fields.
+a column identifying the image — `path` (or `file`, `filename`, `image_path`,
+`image`, `name`, …) — holding the path **relative to the folder root** (e.g.
+`sub/img_0007.jpg`), so it works with recursion. Absolute paths under the
+folder work too. Any other columns become sortable/displayable fields; a column
+of numbers sorts numerically, blanks sort last.
 
 ```csv
 path,severity,camera,notes
@@ -207,7 +210,27 @@ line12/img_0001.jpg,3,front,hairline crack
 line12/img_0002.jpg,0,front,
 ```
 
-`.tsv`, `.json`, `.jsonl`, and `.parquet` (needs pandas) are also accepted.
+Check a file (which images match, column types, common mistakes):
+
+```bash
+winnow --check /path/to/images
+```
+
+## Working with AI agents
+
+If you have an agent pick images and write the metadata (e.g. rank by model
+confidence), let it learn the format from winnow itself:
+
+```bash
+winnow --install-skill   # once: Claude Code skill in ~/.claude/skills/winnow
+winnow --agent-help      # or: print the same guide, for any agent
+winnow --check FOLDER    # the agent validates what it wrote (exit 1 on errors)
+```
+
+With the skill installed, just ask e.g. *"pick the 200 lowest-confidence
+images from runs/42 and set them up in winnow sorted by confidence, with
+buckets crack/spall"* — the agent finds the guide on its own and runs the check.
+Re-run `--install-skill` after upgrading winnow.
 
 ## License
 

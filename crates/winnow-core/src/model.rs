@@ -126,7 +126,11 @@ impl Session {
         }
         let bucket_counts = buckets.iter().map(|b| count_images(&b.target_dir(&root))).collect();
         let metadata = match metadata_path {
-            Some(p) => Metadata::load_csv(p).unwrap_or_default(),
+            Some(p) => {
+                let mut m = Metadata::load_csv(p).unwrap_or_default();
+                m.relativize(&root);
+                m
+            }
             None => Metadata::default(),
         };
         let exclude = bucket_folder_names(&buckets, &root);

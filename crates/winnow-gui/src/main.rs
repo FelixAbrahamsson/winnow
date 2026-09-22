@@ -1,5 +1,6 @@
 //! winnow — GTK4 image culling tool (Rust rewrite). Entry point + CLI.
 
+mod agent;
 mod app;
 mod imageview;
 
@@ -13,7 +14,6 @@ use winnow_core::Session;
 use app::App;
 
 const APP_ID: &str = "com.github.felixabrahamsson.winnow";
-const AUTO_METADATA: &[&str] = &["metadata.csv", "metadata.tsv", "metadata.json"];
 
 #[derive(Parser, Clone)]
 #[command(
@@ -27,7 +27,8 @@ struct Cli {
     /// Do not descend into subfolders (default: recurse).
     #[arg(long)]
     no_recursive: bool,
-    /// Metadata file (.csv/.tsv). Auto-detected as metadata.csv if omitted.
+    /// Metadata file (.csv/.tsv). Auto-detected as metadata.csv / metadata.tsv
+    /// in the folder if omitted.
     #[arg(long)]
     metadata: Option<PathBuf>,
     /// Bucket config TOML (default: .winnow.toml in the folder).
@@ -42,6 +43,16 @@ struct Cli {
     /// Register the "Open With -> Winnow" launcher and exit.
     #[arg(long)]
     install_desktop: bool,
+    /// Validate FOLDER's metadata file against its images and exit
+    /// (non-zero on errors).
+    #[arg(long)]
+    check: bool,
+    /// Print a guide for AI agents: how to write metadata / buckets.
+    #[arg(long)]
+    agent_help: bool,
+    /// Install the agent guide as a Claude Code skill (~/.claude/skills/winnow).
+    #[arg(long)]
+    install_skill: bool,
 }
 
 fn main() -> glib::ExitCode {
@@ -59,6 +70,37 @@ fn main() -> glib::ExitCode {
             }
         }
         return glib::ExitCode::SUCCESS;
+    }
+
+    if cli.agent_help {
+        print!("{}", agent::guide());
+        return glib::ExitCode::SUCCESS;
+    }
+
+    if cli.install_skill {
+        return match agent::install_skill() {
+            Ok(path) => {
+                println!("Installed Claude Code skill: {}", path.display());
+                println!("Agents will now pick it up when you ask them to prepare images for winnow.");
+                glib::ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("winnow: {e}");
+                glib::ExitCode::FAILURE
+            }
+        };
+    }
+
+    if cli.check {
+        let folder = cli.folder.clone().unwrap_or_else(|| PathBuf::from("."));
+        let report = winnow_core::check::check(
+            &folder,
+            !cli.no_recursive,
+            cli.metadata.as_deref(),
+            cli.buckets.as_deref(),
+        );
+        println!("{report}");
+        return if report.has_errors() { glib::ExitCode::FAILURE } else { glib::ExitCode::SUCCESS };
     }
 
     let application = Application::builder()
@@ -87,7 +129,7 @@ pub fn open_target(
     } else {
         (target.to_path_buf(), None, recursive)
     };
-    let meta = metadata.or_else(|| AUTO_METADATA.iter().map(|n| root.join(n)).find(|p| p.exists()));
+    let meta = metadata.or_else(|| winnow_core::metadata::find_metadata(&root));
     let session = Session::new(&root, recursive, buckets.as_deref(), meta.as_deref())?;
     let start = start_file.and_then(|f| session.items.iter().position(|it| it.abs_path == f));
     Ok((session, start))

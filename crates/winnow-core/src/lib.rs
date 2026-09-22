@@ -4,6 +4,7 @@
 //! standalone.
 
 pub mod buckets;
+pub mod check;
 pub mod metadata;
 pub mod model;
 pub mod scan;

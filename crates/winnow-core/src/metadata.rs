@@ -5,7 +5,18 @@ use std::collections::HashMap;
 use std::path::Path;
 
 /// Candidate column names that hold the image path (relative to root).
-const PATH_COLUMNS: &[&str] = &["path", "filepath", "file", "filename", "image", "img", "name"];
+pub const PATH_COLUMNS: &[&str] = &[
+    "path", "filepath", "file_path", "image_path", "img_path", "file", "filename", "file_name",
+    "image", "img", "name",
+];
+
+/// Metadata file names picked up automatically from the folder root.
+pub const AUTO_METADATA: &[&str] = &["metadata.csv", "metadata.tsv"];
+
+/// The auto-detected metadata file in `root`, if any.
+pub fn find_metadata(root: &Path) -> Option<std::path::PathBuf> {
+    AUTO_METADATA.iter().map(|n| root.join(n)).find(|p| p.is_file())
+}
 
 /// A sortable value: numbers sort before text, missing values sort last.
 #[derive(Debug, Clone, PartialEq)]
@@ -44,6 +55,13 @@ impl Ord for SortKey {
 pub struct Metadata {
     /// Display order of columns, excluding the path key column.
     pub columns: Vec<String>,
+    /// Header of the column used as the image path.
+    pub key_column: String,
+    /// False when no known path column name was found and the first column
+    /// was used as a fallback.
+    pub key_column_recognized: bool,
+    /// Path keys that appeared on more than one row (the last row wins).
+    pub duplicate_keys: Vec<String>,
     by_relpath: HashMap<String, HashMap<String, String>>,
     by_basename: HashMap<String, String>,
 }
@@ -59,15 +77,45 @@ impl Metadata {
 
     /// Row for `relpath`, falling back to a unique basename match.
     pub fn get(&self, relpath: &str) -> Option<&HashMap<String, String>> {
+        self.row_key(relpath).and_then(|(k, _)| self.by_relpath.get(k))
+    }
+
+    /// The row key an image resolves to, and whether it matched by full
+    /// relative path (true) or only by filename (false).
+    pub fn row_key(&self, relpath: &str) -> Option<(&str, bool)> {
         let rel = relpath.replace('\\', "/");
-        if let Some(row) = self.by_relpath.get(&rel) {
-            return Some(row);
+        if let Some((k, _)) = self.by_relpath.get_key_value(&rel) {
+            return Some((k.as_str(), true));
         }
         let base = basename(&rel);
-        if let Some(row) = self.by_relpath.get(base) {
-            return Some(row);
+        if let Some((k, _)) = self.by_relpath.get_key_value(base) {
+            return Some((k.as_str(), false));
         }
-        self.by_basename.get(base).and_then(|r| self.by_relpath.get(r))
+        self.by_basename.get(base).map(|r| (r.as_str(), false))
+    }
+
+    /// Row keys in the file.
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.by_relpath.keys().map(|k| k.as_str())
+    }
+
+    /// Raw cell value.
+    pub fn value(&self, key: &str, column: &str) -> Option<&str> {
+        self.by_relpath.get(key).and_then(|r| r.get(column)).map(|s| s.as_str())
+    }
+
+    /// Make keys relative to `root`: absolute paths under root lose the root
+    /// prefix (agents often write absolute paths).
+    pub fn relativize(&mut self, root: &Path) {
+        let root = root.to_string_lossy().replace('\\', "/");
+        let prefix = format!("{}/", root.trim_end_matches('/'));
+        let rows = std::mem::take(&mut self.by_relpath);
+        for (k, v) in rows {
+            let k = k.strip_prefix(&prefix).map(str::to_string).unwrap_or(k);
+            self.by_relpath.insert(k, v);
+        }
+        self.by_basename.clear();
+        self.build_basename_index();
     }
 
     pub fn sort_value(&self, relpath: &str, column: &str) -> SortKey {
@@ -81,13 +129,13 @@ impl Metadata {
         }
     }
 
-    fn pick_path_column(headers: &[String]) -> usize {
+    fn pick_path_column(headers: &[String]) -> (usize, bool) {
         for cand in PATH_COLUMNS {
             if let Some(i) = headers.iter().position(|h| h.eq_ignore_ascii_case(cand)) {
-                return i;
+                return (i, true);
             }
         }
-        0
+        (0, false)
     }
 
     fn build_basename_index(&mut self) {
@@ -119,16 +167,21 @@ impl Metadata {
         if headers.is_empty() {
             return Ok(Metadata::default());
         }
-        let key_col = Self::pick_path_column(&headers);
+        let (key_col, key_column_recognized) = Self::pick_path_column(&headers);
         let columns: Vec<String> =
             headers.iter().enumerate().filter(|(i, _)| *i != key_col).map(|(_, h)| h.clone()).collect();
 
         let mut by_relpath: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let mut duplicate_keys = Vec::new();
         for record in rdr.records() {
             let rec = record?;
             let key = rec.get(key_col).unwrap_or("").trim().replace('\\', "/");
+            let key = key.strip_prefix("./").map(str::to_string).unwrap_or(key);
             if key.is_empty() {
                 continue;
+            }
+            if by_relpath.contains_key(&key) {
+                duplicate_keys.push(key.clone());
             }
             let mut row = HashMap::new();
             for (i, h) in headers.iter().enumerate() {
@@ -140,7 +193,14 @@ impl Metadata {
             by_relpath.insert(key, row);
         }
 
-        let mut meta = Metadata { columns, by_relpath, by_basename: HashMap::new() };
+        let mut meta = Metadata {
+            columns,
+            key_column: headers[key_col].clone(),
+            key_column_recognized,
+            duplicate_keys,
+            by_relpath,
+            by_basename: HashMap::new(),
+        };
         meta.build_basename_index();
         Ok(meta)
     }
@@ -192,6 +252,22 @@ mod tests {
         assert_eq!(m.sort_value("line12/b.jpg", "severity"), SortKey::Missing);
         assert_eq!(m.sort_value("line12/a.jpg", "note"), SortKey::Text("hairline".into()));
 
+        let _ = fs::remove_file(&p);
+    }
+
+    #[test]
+    fn absolute_and_dot_paths_are_made_relative() {
+        let p = std::env::temp_dir().join(format!("winnow-meta-abs-{}.csv", std::process::id()));
+        fs::write(&p, "file,score\n/data/set/sub/a.jpg,1\n./b.jpg,2\nc.jpg,3\nc.jpg,4\n").unwrap();
+        let mut m = Metadata::load_csv(&p).unwrap();
+        assert_eq!(m.key_column, "file");
+        assert!(m.key_column_recognized);
+        assert_eq!(m.duplicate_keys, vec!["c.jpg"]);
+        m.relativize(Path::new("/data/set/"));
+        assert_eq!(m.row_key("sub/a.jpg"), Some(("sub/a.jpg", true)));
+        assert_eq!(m.row_key("b.jpg"), Some(("b.jpg", true)));
+        assert_eq!(m.row_key("x/c.jpg"), Some(("c.jpg", false)));
+        assert_eq!(m.value("c.jpg", "score"), Some("4"));
         let _ = fs::remove_file(&p);
     }
 }
