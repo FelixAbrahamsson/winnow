@@ -35,7 +35,7 @@ const GAMMA_STEP: f64 = 0.1;
 const DEFAULT_SIZE: (i32, i32) = (1280, 820);
 const DEFAULT_INFO_WIDTH: i32 = 320;
 
-// ---- window-state persistence (size + info-panel width) ------------
+// ---- app-state persistence (window size, info-panel width, auto-brightness) ----
 fn window_state_file() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
@@ -43,28 +43,53 @@ fn window_state_file() -> Option<PathBuf> {
     Some(base.join("winnow").join("window"))
 }
 
-fn save_window_state(w: i32, h: i32, maximized: bool, info_w: i32) {
-    if w <= 0 || h <= 0 {
+/// Persisted across launches, for any folder.
+#[derive(Clone, Copy)]
+struct AppState {
+    w: i32,
+    h: i32,
+    maximized: bool,
+    info_w: i32,
+    auto_bright: bool,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        let (w, h) = DEFAULT_SIZE;
+        AppState { w, h, maximized: false, info_w: DEFAULT_INFO_WIDTH, auto_bright: false }
+    }
+}
+
+fn save_app_state(st: AppState) {
+    if st.w <= 0 || st.h <= 0 {
         return;
     }
     if let Some(path) = window_state_file() {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let _ = std::fs::write(path, format!("{w} {h} {} {info_w}", maximized as u8));
+        let _ = std::fs::write(
+            path,
+            format!("{} {} {} {} {}", st.w, st.h, st.maximized as u8, st.info_w, st.auto_bright as u8),
+        );
     }
 }
 
-fn load_window_state() -> (i32, i32, bool, i32) {
-    let (dw, dh) = DEFAULT_SIZE;
-    let Some(path) = window_state_file() else { return (dw, dh, false, DEFAULT_INFO_WIDTH) };
-    let Ok(s) = std::fs::read_to_string(path) else { return (dw, dh, false, DEFAULT_INFO_WIDTH) };
+fn load_app_state() -> AppState {
+    let d = AppState::default();
+    let Some(path) = window_state_file() else { return d };
+    let Ok(s) = std::fs::read_to_string(path) else { return d };
     let mut it = s.split_whitespace();
-    let w = it.next().and_then(|x| x.parse().ok()).filter(|&v| v > 0).unwrap_or(dw);
-    let h = it.next().and_then(|x| x.parse().ok()).filter(|&v| v > 0).unwrap_or(dh);
-    let m = it.next().and_then(|x| x.parse::<u8>().ok()).map(|v| v != 0).unwrap_or(false);
-    let info = it.next().and_then(|x| x.parse().ok()).filter(|&v| v > 0).unwrap_or(DEFAULT_INFO_WIDTH);
-    (w, h, m, info)
+    let num = |x: Option<&str>, fallback: i32| {
+        x.and_then(|v| v.parse().ok()).filter(|&v: &i32| v > 0).unwrap_or(fallback)
+    };
+    let w = num(it.next(), d.w);
+    let h = num(it.next(), d.h);
+    let maximized = it.next().and_then(|x| x.parse::<u8>().ok()).map(|v| v != 0).unwrap_or(false);
+    let info_w = num(it.next(), d.info_w);
+    // Added later: absent in files written by older versions.
+    let auto_bright = it.next().and_then(|x| x.parse::<u8>().ok()).map(|v| v != 0).unwrap_or(false);
+    AppState { w, h, maximized, info_w, auto_bright }
 }
 
 /// Luminance histogram of a pixbuf, sampling down to ~250k pixels.
@@ -289,7 +314,8 @@ impl App {
         info_panel.append(&gtk4::Separator::new(Orientation::Horizontal));
         info_panel.append(&info_scroll);
 
-        let (win_w, win_h, win_max, info_w) = load_window_state();
+        let saved = load_app_state();
+        let (win_w, win_h, win_max, info_w) = (saved.w, saved.h, saved.maximized, saved.info_w);
 
         // Resizable split: drag the divider to size the details panel. The info
         // panel keeps its width when the window resizes (resize_end_child=false);
@@ -364,7 +390,7 @@ impl App {
             open_dialog: RefCell::new(None),
             brightness: Cell::new(1.0),
             gamma: Cell::new(1.0),
-            auto_bright: Cell::new(false),
+            auto_bright: Cell::new(saved.auto_bright),
             auto_check: RefCell::new(None),
             cur_hist: RefCell::new(None),
             bri_scale: RefCell::new(None),
@@ -630,6 +656,19 @@ impl App {
         }
     }
 
+    fn save_state(&self) {
+        save_app_state(AppState {
+            w: self.window.width(),
+            h: self.window.height(),
+            maximized: self.window.is_maximized(),
+            // Exact inverse of the restore above (which sets the position from
+            // the paned's own width). Using info_panel.width() or the window
+            // width instead loses the handle width on every launch.
+            info_w: (self.paned.width() - self.paned.position()).max(120),
+            auto_bright: self.auto_bright.get(),
+        });
+    }
+
     fn set_auto_brightness(self: &Rc<Self>, on: bool) {
         if self.auto_bright.replace(on) == on {
             return;
@@ -637,6 +676,8 @@ impl App {
         if let Some(c) = self.auto_check.borrow().as_ref() {
             c.set_active(on);
         }
+        // Remembered for the next launch, in any folder.
+        self.save_state();
         self.flash(format!("Auto brightness {}", if on { "on" } else { "off" }));
     }
 
@@ -757,12 +798,7 @@ impl App {
                 }
                 if let Some(gtkapp) = self.window.application() {
                     // Carry the current size + panel width to the replacement window.
-                    save_window_state(
-                        self.window.width(),
-                        self.window.height(),
-                        self.window.is_maximized(),
-                        self.info_panel.width(),
-                    );
+                    self.save_state();
                     App::new(&gtkapp, session, None);
                     self.window.close();
                 }
@@ -880,15 +916,10 @@ impl App {
         self.build_grid();
         self.build_header();
 
-        // Remember the window size and info-panel width for the next launch.
+        // Remember window size, panel width and auto-brightness for next launch.
         let app = self.clone();
         self.window.connect_close_request(move |_win| {
-            save_window_state(
-                app.window.width(),
-                app.window.height(),
-                app.window.is_maximized(),
-                app.info_panel.width(),
-            );
+            app.save_state();
             glib::Propagation::Proceed
         });
     }
@@ -947,6 +978,7 @@ impl App {
         auto.set_tooltip_text(Some(
             "Set each new image's brightness so it looks as bright as the last one (B)",
         ));
+        auto.set_active(self.auto_bright.get());
         {
             let app = self.clone();
             auto.connect_toggled(move |c| app.set_auto_brightness(c.is_active()));
@@ -1518,5 +1550,35 @@ impl App {
             });
         }
         self.view.add_controller(drag);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The state file round-trips, and a file from before auto-brightness was
+    /// added still loads (with the setting off).
+    #[test]
+    fn app_state_roundtrip_and_backward_compat() {
+        let dir = std::env::temp_dir().join(format!("winnow-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("XDG_STATE_HOME", &dir);
+
+        let st = AppState { w: 1200, h: 800, maximized: true, info_w: 333, auto_bright: true };
+        save_app_state(st);
+        let got = load_app_state();
+        assert_eq!((got.w, got.h, got.maximized, got.info_w, got.auto_bright), (1200, 800, true, 333, true));
+
+        std::fs::write(window_state_file().unwrap(), "1000 700 0 300").unwrap();
+        let old = load_app_state();
+        assert_eq!((old.w, old.h, old.info_w), (1000, 700, 300));
+        assert!(!old.auto_bright);
+
+        std::fs::write(window_state_file().unwrap(), "garbage").unwrap();
+        let bad = load_app_state();
+        assert_eq!((bad.w, bad.h), DEFAULT_SIZE);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

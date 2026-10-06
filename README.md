@@ -147,6 +147,7 @@ Changing the sort key jumps you to the first image of the new order.
 on, each new image gets the brightness that makes it look as bright (same mean
 displayed luminance) as the previous image did — handy when exposure swings
 between captures. Tune the brightness once, then step through; gamma is kept.
+The setting is remembered across launches, for every folder.
 
 ## Buckets (sorting into classes)
 
