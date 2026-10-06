@@ -118,6 +118,7 @@ impl App {
             self.in_grid.set(false);
             self.stack.set_visible_child_name("single");
             self.refresh();
+            self.focus_view();
         } else {
             self.sync_grid_model();
             self.in_grid.set(true);

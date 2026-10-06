@@ -51,11 +51,15 @@ fn unfocusable_slot(w: &impl IsA<gtk4::Widget>) {
     }
 }
 
-/// A popover attached to `anchor` that detaches itself once closed.
-fn transient_popover(anchor: &impl IsA<gtk4::Widget>) -> gtk4::Popover {
+/// A popover attached to `anchor` that detaches itself once closed and hands
+/// keyboard focus back to the image view (otherwise its entry keeps the focus
+/// and the arrow keys stop navigating).
+fn transient_popover(app: &Rc<App>, anchor: &impl IsA<gtk4::Widget>) -> gtk4::Popover {
     let pop = gtk4::Popover::new();
     pop.set_parent(anchor);
-    pop.connect_closed(|p| {
+    let app = app.clone();
+    pop.connect_closed(move |p| {
+        app.focus_view();
         let p = p.clone();
         glib::idle_add_local_once(move || p.unparent());
     });
@@ -184,7 +188,7 @@ impl App {
         row.set_margin_end(6);
         row.append(&entry);
         row.append(&add);
-        let pop = transient_popover(anchor);
+        let pop = transient_popover(self, anchor);
         pop.set_child(Some(&row));
 
         let submit = {
@@ -226,7 +230,7 @@ impl App {
                 None => return,
             }
         };
-        let pop = transient_popover(chip);
+        let pop = transient_popover(self, chip);
 
         let vbox = gtk4::Box::new(Orientation::Vertical, 6);
         vbox.set_margin_top(6);

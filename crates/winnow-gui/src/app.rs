@@ -413,6 +413,7 @@ impl App {
             app.apply_sort_from_ui();
         }
         app.window.present();
+        app.view.grab_focus();
 
         // Once the window has its real size, set the divider so the info panel
         // gets its saved width (needed for restored/maximized windows, where the
@@ -1058,6 +1059,16 @@ impl App {
 
     fn toggle_info(&self) {
         self.info_panel.set_visible(!self.info_panel.is_visible());
+        // Hiding the panel can strand focus on one of its widgets.
+        self.focus_view();
+    }
+
+    /// Put keyboard focus back on the image view, where no key is consumed
+    /// before the window's shortcut handler.
+    pub(super) fn focus_view(&self) {
+        if !self.in_grid.get() {
+            self.view.grab_focus();
+        }
     }
 
     fn update_info(&self) {

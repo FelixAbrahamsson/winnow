@@ -36,6 +36,11 @@ mod imp {
             self.scale.set(1.0);
             self.fitted.set(true);
             self.brightness.set(1.0);
+            // Focusable so keyboard focus has a home that ignores every key:
+            // otherwise focus is left on whatever widget was last used (a
+            // popover entry, the paned divider) and that widget eats the
+            // arrow keys before the window's shortcuts see them.
+            self.obj().set_focusable(true);
         }
     }
 
