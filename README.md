@@ -130,6 +130,7 @@ list at any time.
 | `\` | Reset brightness & gamma |
 | `{` / `}` | Gamma down / up |
 | `B` | Toggle auto brightness (match the previous image's look) |
+| `R` | Toggle Retinex (even out uneven lighting) |
 | `Ctrl+C` / `Ctrl+Shift+C` | Copy filename / full path |
 | `G` | Toggle grid ↔ single view |
 | `I` | Toggle info panel |
@@ -148,6 +149,13 @@ on, each new image gets the brightness that makes it look as bright (same mean
 displayed luminance) as the previous image did — handy when exposure swings
 between captures. Tune the brightness once, then step through; gamma is kept.
 The setting is remembered across launches, for every folder.
+
+**Retinex** (`R`, or the checkbox in the ☀ Brightness popover): normalises
+uneven illumination (dark corners, vignetting, exposure gradients across a
+line-scan image) with multi-scale Retinex, so texture and defects read
+equally well everywhere in the image. It changes the view only — files are
+never modified — and grid thumbnails stay as-is. Brightness, gamma and auto
+brightness apply on top. Also remembered across launches.
 
 ## Buckets (sorting into classes)
 

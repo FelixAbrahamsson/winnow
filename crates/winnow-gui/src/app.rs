@@ -21,6 +21,7 @@ use gtk4::{
     EventControllerScrollFlags, GestureClick, GestureDrag, Label, Orientation, PropagationPhase,
     ScrolledWindow,
 };
+use winnow_core::retinex;
 use winnow_core::tone::{self, Histogram};
 use winnow_core::Session;
 
@@ -35,7 +36,7 @@ const GAMMA_STEP: f64 = 0.1;
 const DEFAULT_SIZE: (i32, i32) = (1280, 820);
 const DEFAULT_INFO_WIDTH: i32 = 320;
 
-// ---- app-state persistence (window size, info-panel width, auto-brightness) ----
+// ---- app-state persistence (window size, info-panel width, auto-brightness, retinex) ----
 fn window_state_file() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
@@ -51,12 +52,13 @@ struct AppState {
     maximized: bool,
     info_w: i32,
     auto_bright: bool,
+    retinex: bool,
 }
 
 impl Default for AppState {
     fn default() -> Self {
         let (w, h) = DEFAULT_SIZE;
-        AppState { w, h, maximized: false, info_w: DEFAULT_INFO_WIDTH, auto_bright: false }
+        AppState { w, h, maximized: false, info_w: DEFAULT_INFO_WIDTH, auto_bright: false, retinex: false }
     }
 }
 
@@ -70,7 +72,10 @@ fn save_app_state(st: AppState) {
         }
         let _ = std::fs::write(
             path,
-            format!("{} {} {} {} {}", st.w, st.h, st.maximized as u8, st.info_w, st.auto_bright as u8),
+            format!(
+                "{} {} {} {} {} {}",
+                st.w, st.h, st.maximized as u8, st.info_w, st.auto_bright as u8, st.retinex as u8
+            ),
         );
     }
 }
@@ -88,8 +93,10 @@ fn load_app_state() -> AppState {
     let maximized = it.next().and_then(|x| x.parse::<u8>().ok()).map(|v| v != 0).unwrap_or(false);
     let info_w = num(it.next(), d.info_w);
     // Added later: absent in files written by older versions.
-    let auto_bright = it.next().and_then(|x| x.parse::<u8>().ok()).map(|v| v != 0).unwrap_or(false);
-    AppState { w, h, maximized, info_w, auto_bright }
+    let mut flag = || it.next().and_then(|x| x.parse::<u8>().ok()).map(|v| v != 0).unwrap_or(false);
+    let auto_bright = flag();
+    let retinex = flag();
+    AppState { w, h, maximized, info_w, auto_bright, retinex }
 }
 
 /// Luminance histogram of a pixbuf, sampling down to ~250k pixels.
@@ -98,6 +105,27 @@ fn histogram(pb: &Pixbuf) -> Histogram {
     let step = ((w * h) as f64 / 250_000.0).sqrt().ceil().max(1.0) as usize;
     let data = pb.read_pixel_bytes();
     tone::luminance_histogram(&data, w, h, pb.rowstride() as usize, pb.n_channels() as usize, step)
+}
+
+/// Multi-scale Retinex copy of a pixbuf (evens out uneven lighting).
+fn retinex_pixbuf(orig: &Pixbuf) -> Pixbuf {
+    let mut data = orig.read_pixel_bytes().to_vec();
+    retinex::apply(
+        &mut data,
+        orig.width() as usize,
+        orig.height() as usize,
+        orig.rowstride() as usize,
+        orig.n_channels() as usize,
+    );
+    Pixbuf::from_bytes(
+        &glib::Bytes::from_owned(data),
+        orig.colorspace(),
+        orig.has_alpha(),
+        orig.bits_per_sample(),
+        orig.width(),
+        orig.height(),
+        orig.rowstride(),
+    )
 }
 
 /// Apply gamma to a pixbuf via a per-channel LUT. Identity fast-path.
@@ -158,6 +186,10 @@ pub struct App {
     thumb_cache: RefCell<HashMap<PathBuf, gdk::Texture>>,
     in_grid: Cell<bool>,
     orig_pixbuf: RefCell<Option<Pixbuf>>,
+    // What gamma/brightness are applied to: the original, or its Retinex.
+    base_pixbuf: RefCell<Option<Pixbuf>>,
+    retinex: Cell<bool>,
+    retinex_check: RefCell<Option<gtk4::CheckButton>>,
     cur_path: RefCell<PathBuf>,
     open_dialog: RefCell<Option<gtk4::FileChooserNative>>,
     brightness: Cell<f64>,
@@ -386,6 +418,9 @@ impl App {
             thumb_cache: RefCell::new(HashMap::new()),
             in_grid: Cell::new(false),
             orig_pixbuf: RefCell::new(None),
+            base_pixbuf: RefCell::new(None),
+            retinex: Cell::new(saved.retinex),
+            retinex_check: RefCell::new(None),
             cur_path: RefCell::new(PathBuf::new()),
             open_dialog: RefCell::new(None),
             brightness: Cell::new(1.0),
@@ -445,12 +480,13 @@ impl App {
                 match Pixbuf::from_file(&p) {
                     Ok(pb) => {
                         let pb = pb.apply_embedded_orientation().unwrap_or(pb);
-                        let hist = histogram(&pb);
+                        *self.orig_pixbuf.borrow_mut() = Some(pb);
+                        // Auto brightness matches what's shown, so use the base.
+                        let hist = self.rebuild_base();
                         if self.auto_bright.get() && !same_image {
                             self.auto_match(&hist);
                         }
                         *self.cur_hist.borrow_mut() = Some(hist);
-                        *self.orig_pixbuf.borrow_mut() = Some(pb);
                         // New image starts fitted (so it fills the viewport).
                         self.view.set_fitted(true);
                         self.render();
@@ -458,6 +494,7 @@ impl App {
                     }
                     Err(_) => {
                         *self.orig_pixbuf.borrow_mut() = None;
+                        *self.base_pixbuf.borrow_mut() = None;
                         *self.cur_hist.borrow_mut() = None;
                         self.view.set_texture(None);
                     }
@@ -465,6 +502,7 @@ impl App {
             }
             None => {
                 *self.orig_pixbuf.borrow_mut() = None;
+                *self.base_pixbuf.borrow_mut() = None;
                 self.view.set_texture(None);
             }
         }
@@ -472,11 +510,24 @@ impl App {
         self.update_info();
     }
 
+    /// Derive the base image from the original (Retinex if on) and return its
+    /// histogram. Cached, as Retinex is too slow to redo on every gamma change.
+    fn rebuild_base(&self) -> Histogram {
+        let base = self
+            .orig_pixbuf
+            .borrow()
+            .as_ref()
+            .map(|pb| if self.retinex.get() { retinex_pixbuf(pb) } else { pb.clone() });
+        let hist = base.as_ref().map(histogram).unwrap_or([0; 256]);
+        *self.base_pixbuf.borrow_mut() = base;
+        hist
+    }
+
     /// Rebuild the texture with the current gamma (keeps zoom/pan). Costly on
     /// big images, so only for a new image or a gamma change.
     fn render(&self) {
-        if let Some(orig) = self.orig_pixbuf.borrow().as_ref() {
-            let adj = gamma_pixbuf(orig, self.gamma.get());
+        if let Some(base) = self.base_pixbuf.borrow().as_ref() {
+            let adj = gamma_pixbuf(base, self.gamma.get());
             let tex = gdk::Texture::for_pixbuf(&adj);
             self.view.set_texture(Some(tex));
         }
@@ -667,6 +718,7 @@ impl App {
             // width instead loses the handle width on every launch.
             info_w: (self.paned.width() - self.paned.position()).max(120),
             auto_bright: self.auto_bright.get(),
+            retinex: self.retinex.get(),
         });
     }
 
@@ -680,6 +732,20 @@ impl App {
         // Remembered for the next launch, in any folder.
         self.save_state();
         self.flash(format!("Auto brightness {}", if on { "on" } else { "off" }));
+    }
+
+    fn set_retinex(self: &Rc<Self>, on: bool) {
+        if self.retinex.replace(on) == on {
+            return;
+        }
+        if let Some(c) = self.retinex_check.borrow().as_ref() {
+            c.set_active(on);
+        }
+        let hist = self.rebuild_base();
+        *self.cur_hist.borrow_mut() = Some(hist);
+        self.render();
+        self.save_state();
+        self.flash(format!("Retinex {}", if on { "on" } else { "off" }));
     }
 
     // ---- buckets / undo -------------------------------------------
@@ -855,6 +921,7 @@ impl App {
                 row("} / {", "Gamma up / down"),
                 row("\\", "Reset brightness & gamma"),
                 row("b", "Toggle auto brightness (match previous image)"),
+                row("r", "Toggle Retinex (even out uneven lighting)"),
             ]
             .concat(),
             files = [
@@ -984,6 +1051,15 @@ impl App {
             let app = self.clone();
             auto.connect_toggled(move |c| app.set_auto_brightness(c.is_active()));
         }
+        let retinex_btn = gtk4::CheckButton::with_label("Retinex (even out lighting)");
+        retinex_btn.set_tooltip_text(Some(
+            "Normalise uneven illumination with multi-scale Retinex (R)",
+        ));
+        retinex_btn.set_active(self.retinex.get());
+        {
+            let app = self.clone();
+            retinex_btn.connect_toggled(move |c| app.set_retinex(c.is_active()));
+        }
         let reset = gtk4::Button::with_label("Reset");
         {
             let bri = bri_scale.clone();
@@ -1000,10 +1076,12 @@ impl App {
         pbox.append(&gl);
         pbox.append(&gam_scale);
         pbox.append(&auto);
+        pbox.append(&retinex_btn);
         pbox.append(&reset);
         *self.bri_scale.borrow_mut() = Some(bri_scale.clone());
         *self.gam_scale.borrow_mut() = Some(gam_scale.clone());
         *self.auto_check.borrow_mut() = Some(auto);
+        *self.retinex_check.borrow_mut() = Some(retinex_btn);
         pop.set_child(Some(&pbox));
         bri_btn.set_popover(Some(&pop));
         header.pack_start(&bri_btn);
@@ -1415,6 +1493,7 @@ impl App {
                 gdk::Key::F11 => app.toggle_fullscreen(),
                 gdk::Key::i => app.toggle_info(),
                 gdk::Key::b => app.set_auto_brightness(!app.auto_bright.get()),
+                gdk::Key::r => app.set_retinex(!app.retinex.get()),
                 gdk::Key::g => app.toggle_view(),
                 gdk::Key::question | gdk::Key::F1 => app.show_help(),
                 _ => return Proceed,
@@ -1568,23 +1647,37 @@ impl App {
 mod tests {
     use super::*;
 
-    /// The state file round-trips, and a file from before auto-brightness was
-    /// added still loads (with the setting off).
+    /// The state file round-trips, and files from before auto-brightness /
+    /// Retinex were added still load (with those settings off).
     #[test]
     fn app_state_roundtrip_and_backward_compat() {
         let dir = std::env::temp_dir().join(format!("winnow-state-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("XDG_STATE_HOME", &dir);
 
-        let st = AppState { w: 1200, h: 800, maximized: true, info_w: 333, auto_bright: true };
+        let st = AppState {
+            w: 1200,
+            h: 800,
+            maximized: true,
+            info_w: 333,
+            auto_bright: true,
+            retinex: true,
+        };
         save_app_state(st);
         let got = load_app_state();
-        assert_eq!((got.w, got.h, got.maximized, got.info_w, got.auto_bright), (1200, 800, true, 333, true));
+        assert_eq!(
+            (got.w, got.h, got.maximized, got.info_w, got.auto_bright, got.retinex),
+            (1200, 800, true, 333, true, true)
+        );
 
         std::fs::write(window_state_file().unwrap(), "1000 700 0 300").unwrap();
         let old = load_app_state();
         assert_eq!((old.w, old.h, old.info_w), (1000, 700, 300));
-        assert!(!old.auto_bright);
+        assert!(!old.auto_bright && !old.retinex);
+
+        std::fs::write(window_state_file().unwrap(), "1000 700 0 300 1").unwrap();
+        let old = load_app_state();
+        assert!(old.auto_bright && !old.retinex);
 
         std::fs::write(window_state_file().unwrap(), "garbage").unwrap();
         let bad = load_app_state();

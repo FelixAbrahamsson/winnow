@@ -7,6 +7,7 @@ pub mod buckets;
 pub mod check;
 pub mod metadata;
 pub mod model;
+pub mod retinex;
 pub mod scan;
 pub mod tone;
 
