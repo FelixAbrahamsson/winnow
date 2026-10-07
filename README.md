@@ -114,7 +114,7 @@ list at any time.
 | mouse Back / Forward buttons | Previous / next image |
 | `PgDn` / `PgUp` | Jump ±10 |
 | `Home` / `End` | First / last |
-| `Delete` / `Backspace` / `X` | Reject (move to `_rejected/`) |
+| `Delete` / `1` / `Backspace` / `X` | Reject (move to `_rejected/`) |
 | *bucket keys* / click a chip | Move to that bucket |
 | `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo the last move |
 | scroll wheel / pinch | Zoom in / out (toward cursor) |
@@ -162,13 +162,14 @@ brightness apply on top. Also remembered across launches.
 Each bucket is a folder + a hotkey. Pressing the key (or clicking the bucket's
 chip in the bar under the image) moves the current image — or, in grid view,
 all selected images — into that folder, preserving subfolder structure, fully
-undoable. Out of the box there is just **reject** (`Delete` → `_rejected/`).
+undoable. Out of the box there is just **reject** (`Delete` or `1` →
+`_rejected/`).
 
 **The bucket bar** shows every bucket as a chip: hotkey, name, and how many
 images are in it. The chip flashes when you press its key.
 
 - **Add** a bucket with the `+` chip: type a name and it gets folder `_name/`
-  and the next free digit key `1`–`9`.
+  and the next free digit key `2`–`9` (`1` is reject).
 - **Rename / remove** a bucket by right-clicking its chip. Renaming also
   renames its folder. Removing only forgets the bucket — its folder and images
   stay put (and rejoin the queue the next time you open the folder).
@@ -189,14 +190,17 @@ folder = "_rejected"
 
 [[bucket]]
 name = "crack"
-key = "1"
+key = "2"
 folder = "_crack"
 
 [[bucket]]
 name = "spall"
-key = "2"
+key = "3"
 folder = "_spall"
 ```
+
+`1` also rejects, unless a bucket binds `key = "1"` itself (older configs
+keep working).
 
 An empty `key = ""` means the bucket has no hotkey (click its chip instead).
 

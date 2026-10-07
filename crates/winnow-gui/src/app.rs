@@ -21,7 +21,7 @@ use gtk4::{
     EventControllerScrollFlags, GestureClick, GestureDrag, Label, Orientation, PropagationPhase,
     ScrolledWindow,
 };
-use winnow_core::retinex;
+use winnow_core::{buckets, retinex};
 use winnow_core::tone::{self, Histogram};
 use winnow_core::Session;
 
@@ -880,9 +880,12 @@ impl App {
             format!("  <tt>{:<26}</tt> {}\n", key, glib::markup_escape_text(desc))
         }
         let mut buckets = String::new();
-        for b in &self.session.borrow().buckets {
+        let all = &self.session.borrow().buckets;
+        for b in all {
             if b.is_reject {
-                buckets.push_str(&row("Delete / Backspace / x", "Reject → move to _rejected/"));
+                let keys =
+                    if buckets::one_rejects(all) { "Delete / 1 / Backspace / x" } else { "Delete / Backspace / x" };
+                buckets.push_str(&row(keys, "Reject → move to _rejected/"));
             } else {
                 let key = if b.key.is_empty() { "(click its chip)" } else { &b.key };
                 buckets.push_str(&row(
@@ -1382,22 +1385,7 @@ impl App {
                 }
                 if !ctrl {
                     if let Some(kn) = keyval.name() {
-                        let kn = kn.to_string();
-                        let bidx = app
-                            .session
-                            .borrow()
-                            .buckets
-                            .iter()
-                            .position(|b| b.key.eq_ignore_ascii_case(&kn))
-                            .or_else(|| {
-                                if kn.eq_ignore_ascii_case("BackSpace")
-                                    || kn.eq_ignore_ascii_case("x")
-                                {
-                                    Some(0)
-                                } else {
-                                    None
-                                }
-                            });
+                        let bidx = buckets::bucket_for_key(&app.session.borrow().buckets, &kn);
                         if let Some(i) = bidx {
                             app.move_selected(i);
                             return Stop;
@@ -1427,22 +1415,9 @@ impl App {
                 return Stop;
             }
 
-            // Bucket hotkeys by GDK key name; reject also answers Backspace / x.
+            // Bucket hotkeys by GDK key name; reject also answers its aliases.
             if let Some(kn) = keyval.name() {
-                let kn = kn.to_string();
-                let bidx = app
-                    .session
-                    .borrow()
-                    .buckets
-                    .iter()
-                    .position(|b| b.key.eq_ignore_ascii_case(&kn))
-                    .or_else(|| {
-                        if kn.eq_ignore_ascii_case("BackSpace") || kn.eq_ignore_ascii_case("x") {
-                            Some(0)
-                        } else {
-                            None
-                        }
-                    });
+                let bidx = buckets::bucket_for_key(&app.session.borrow().buckets, &kn);
                 if let Some(i) = bidx {
                     app.move_to_bucket(i);
                     return Stop;

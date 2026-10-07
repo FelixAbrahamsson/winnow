@@ -574,7 +574,7 @@ mod tests {
         fs::write(root.join("todo.jpg"), b"x").unwrap();
         let s = Session::new(&root, true, None, None).unwrap();
         assert_eq!(s.buckets[1].name, "crack");
-        assert_eq!(s.buckets[1].key, "1");
+        assert_eq!(s.buckets[1].key, "2");
         assert_eq!(s.bucket_counts, vec![0, 2]);
         assert_eq!(s.count(), 1); // only todo.jpg is left to sort
         let _ = fs::remove_dir_all(&root);
@@ -600,7 +600,7 @@ mod tests {
         assert!(s.add_bucket("  ").is_err());
         let i = s.add_bucket("crack").unwrap();
         assert!(s.add_bucket("Crack").is_err());
-        assert_eq!(s.buckets[i].key, "1");
+        assert_eq!(s.buckets[i].key, "2");
         assert_eq!(load_buckets(&root, None).unwrap(), s.buckets);
 
         s.move_current_to(i).unwrap();

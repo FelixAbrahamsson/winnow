@@ -10,6 +10,7 @@ use gtk4::gdk;
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{GestureClick, Label, Orientation};
+use winnow_core::buckets::{self, Bucket};
 
 use super::App;
 
@@ -34,11 +35,21 @@ pub(super) struct Chip {
     sig: (String, String, String),
 }
 
+/// The chip's key text; reject also shows "1" while that rejects.
+fn chip_key(b: &Bucket, all: &[Bucket]) -> String {
+    let key = key_label(&b.key);
+    if b.is_reject && buckets::one_rejects(all) && b.key != "1" {
+        format!("{key} / 1")
+    } else {
+        key
+    }
+}
+
 fn chip_markup(key: &str, name: &str, count: usize) -> String {
     let key = if key.is_empty() {
         String::new()
     } else {
-        format!("<b>{}</b>  ", glib::markup_escape_text(&key_label(key)))
+        format!("<b>{}</b>  ", glib::markup_escape_text(key))
     };
     format!("{key}{}  <span alpha=\"60%\">{count}</span>", glib::markup_escape_text(name))
 }
@@ -93,7 +104,7 @@ impl App {
             if same {
                 for (i, c) in chips.iter().enumerate() {
                     let b = &s.buckets[i];
-                    c.label.set_markup(&chip_markup(&b.key, &b.name, s.bucket_counts[i]));
+                    c.label.set_markup(&chip_markup(&chip_key(b, &s.buckets), &b.name, s.bucket_counts[i]));
                 }
                 return;
             }
@@ -107,7 +118,7 @@ impl App {
             for (i, b) in s.buckets.iter().enumerate() {
                 let count = s.bucket_counts.get(i).copied().unwrap_or(0);
                 let lbl = Label::new(None);
-                lbl.set_markup(&chip_markup(&b.key, &b.name, count));
+                lbl.set_markup(&chip_markup(&chip_key(b, &s.buckets), &b.name, count));
                 let chip = gtk4::Button::builder().child(&lbl).focusable(false).build();
                 chip.add_css_class("bucket-chip");
                 let hint = if b.is_reject { "" } else { " · right-click to rename / remove" };

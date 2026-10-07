@@ -1,6 +1,7 @@
 //! Bucket configuration: where images get moved and by which hotkey.
 //!
-//! Zero config == a single built-in "reject" bucket bound to Delete, plus any
+//! Zero config == a single built-in "reject" bucket bound to Delete (and the
+//! [`REJECT_ALIASES`]), plus any
 //! `_name/` folders already in the scan root (see [`discover_buckets`]). An
 //! optional `.winnow.toml` in the scan root adds category buckets; once it
 //! exists it is authoritative and discovery is skipped.
@@ -10,6 +11,10 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 pub const CONFIG_NAME: &str = ".winnow.toml";
+
+/// Extra keys that reject, unless a bucket binds the same key itself. "1" is
+/// one of them, so new buckets get digits from 2.
+pub const REJECT_ALIASES: [&str; 3] = ["BackSpace", "x", "1"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bucket {
@@ -119,9 +124,23 @@ pub fn load_buckets(root: &Path, config_path: Option<&Path>) -> Result<Vec<Bucke
     Ok(buckets)
 }
 
-/// First unused digit hotkey 1–9, or "" (no hotkey) when all are taken.
+/// Index of the bucket a key press (GDK key name) moves to: the bucket bound
+/// to that key, else reject (index 0) for one of its aliases.
+pub fn bucket_for_key(buckets: &[Bucket], key: &str) -> Option<usize> {
+    buckets.iter().position(|b| b.key.eq_ignore_ascii_case(key)).or_else(|| {
+        REJECT_ALIASES.iter().any(|a| a.eq_ignore_ascii_case(key)).then_some(0)
+    })
+}
+
+/// Whether "1" still rejects (no bucket has taken it over).
+pub fn one_rejects(buckets: &[Bucket]) -> bool {
+    bucket_for_key(buckets, "1") == Some(0)
+}
+
+/// First unused digit hotkey 2–9 ("1" rejects), or "" (no hotkey) when all
+/// are taken.
 pub fn next_free_key(buckets: &[Bucket]) -> String {
-    (1..=9)
+    (2..=9)
         .map(|d| d.to_string())
         .find(|k| !buckets.iter().any(|b| b.key.eq_ignore_ascii_case(k)))
         .unwrap_or_default()
@@ -204,21 +223,44 @@ mod tests {
         let mut b = vec![default_reject()];
         discover_buckets(&root, &mut b);
         let got: Vec<(&str, &str)> = b.iter().map(|b| (b.name.as_str(), b.key.as_str())).collect();
-        assert_eq!(got, vec![("reject", "Delete"), ("crack", "1"), ("spall", "2")]);
+        assert_eq!(got, vec![("reject", "Delete"), ("crack", "2"), ("spall", "3")]);
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn next_free_key_skips_taken_and_runs_out() {
         let mut b = vec![default_reject()];
-        for k in ["1", "3"] {
+        assert_eq!(next_free_key(&b), "2");
+        for k in ["2", "4"] {
             b.push(Bucket { name: k.into(), key: k.into(), folder: format!("_{k}"), is_reject: false });
         }
-        assert_eq!(next_free_key(&b), "2");
-        for k in 1..=9 {
+        assert_eq!(next_free_key(&b), "3");
+        for k in 2..=9 {
             b.push(Bucket { name: format!("x{k}"), key: k.to_string(), folder: String::new(), is_reject: false });
         }
         assert_eq!(next_free_key(&b), "");
+    }
+
+    #[test]
+    fn one_and_aliases_reject_unless_a_bucket_binds_them() {
+        let crack = |key: &str| Bucket {
+            name: "crack".into(),
+            key: key.into(),
+            folder: "_crack".into(),
+            is_reject: false,
+        };
+        let b = vec![default_reject(), crack("2")];
+        for k in ["Delete", "1", "BackSpace", "X"] {
+            assert_eq!(bucket_for_key(&b, k), Some(0), "{k}");
+        }
+        assert_eq!(bucket_for_key(&b, "2"), Some(1));
+        assert_eq!(bucket_for_key(&b, "3"), None);
+        assert!(one_rejects(&b));
+
+        // An existing config that binds 1 keeps it.
+        let b = vec![default_reject(), crack("1")];
+        assert_eq!(bucket_for_key(&b, "1"), Some(1));
+        assert!(!one_rejects(&b));
     }
 
     #[test]

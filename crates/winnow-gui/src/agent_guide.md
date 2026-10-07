@@ -71,23 +71,23 @@ Built-in sort keys: `name`, `path`, `mtime`, `size`, `meta:COLUMN`.
 Pressing a bucket's hotkey (or clicking its chip) **moves** the image into the
 bucket's folder under the review root, keeping its subfolder path
 (`line12/img_0001.jpg` → `_crack/line12/img_0001.jpg`). Undoable in the app.
-`Delete` → `_rejected/` always exists.
+`Delete` (or `1`) → `_rejected/` always exists.
 
 Easiest setup: create empty folders named `_<class>` in the review root (e.g.
 `_crack/`, `_spall/`); with no config file, winnow turns each into a bucket
-with digit hotkeys 1, 2, … in name order. For explicit hotkeys, write
+with digit hotkeys 2, 3, … in name order (`1` is reject). For explicit hotkeys, write
 `.winnow.toml` in the review root instead (once it exists, folder discovery
 is off):
 
 ```toml
 [[bucket]]
 name = "crack"
-key = "1"          # GDK key name; digits 1-9 recommended; "" = no hotkey
+key = "2"          # GDK key name; digits 2-9 recommended (1 = reject); "" = no hotkey
 folder = "_crack"  # relative to the review root
 
 [[bucket]]
 name = "spall"
-key = "2"
+key = "3"
 folder = "_spall"
 ```
 
