@@ -339,6 +339,21 @@ impl App {
         info_scroll.set_can_focus(false);
         info_scroll.set_kinetic_scrolling(false);
         info_rows.set_can_focus(false);
+        // Unfocused labels keep their selection, so a press in one label
+        // clears the others' (else a stale selection would win Ctrl+C).
+        let clear_sel = GestureClick::new();
+        clear_sel.set_propagation_phase(PropagationPhase::Capture);
+        clear_sel.connect_pressed(|g, _n, x, y| {
+            let Some(rows) = g.widget() else { return };
+            let hit = rows.pick(x, y, gtk4::PickFlags::DEFAULT);
+            for_each_label(&rows, &mut |l| {
+                let inside = hit.as_ref().is_some_and(|h| h == l.upcast_ref::<gtk4::Widget>() || h.is_ancestor(l));
+                if !inside && l.selection_bounds().is_some() {
+                    l.select_region(0, 0);
+                }
+            });
+        });
+        info_rows.add_controller(clear_sel);
 
         let info_panel = gtk4::Box::new(Orientation::Vertical, 0);
         info_panel.set_width_request(200);
@@ -1184,6 +1199,24 @@ impl App {
         }
     }
 
+    /// The text currently selected in a details-panel label, if any.
+    fn info_selection(&self) -> Option<String> {
+        let mut found = None;
+        for_each_label(self.info_rows.upcast_ref(), &mut |l| {
+            if found.is_none() {
+                if let Some((a, b)) = l.selection_bounds() {
+                    // Bounds are character offsets, in either order.
+                    let (a, b) = (a.min(b) as usize, a.max(b) as usize);
+                    let t: String = l.text().chars().skip(a).take(b - a).collect();
+                    if !t.is_empty() {
+                        found = Some(t);
+                    }
+                }
+            }
+        });
+        found
+    }
+
     fn add_section(&self, title: &str) {
         let l = Label::builder().use_markup(true).xalign(0.0).margin_top(8).margin_bottom(2).build();
         l.set_markup(&format!("<b>{}</b>", glib::markup_escape_text(title)));
@@ -1361,13 +1394,13 @@ impl App {
             }
             let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
             let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
-            // Ctrl+C with text selected in a metadata label copies that text.
-            if ctrl && keyval == gdk::Key::c {
-                let focus = gtk4::prelude::GtkWindowExt::focus(&app.window);
-                if let Some(l) = focus.and_then(|w| w.downcast::<Label>().ok()) {
-                    if l.selection_bounds().is_some() {
-                        return Proceed;
-                    }
+            // Ctrl+C with text selected in a details label copies that text.
+            // Can't rely on the label's own copy: the info area is
+            // can_focus(false), so its labels never get keyboard focus.
+            if ctrl && !shift && keyval == gdk::Key::c {
+                if let Some(text) = app.info_selection() {
+                    app.window.clipboard().set_text(&text);
+                    return Stop;
                 }
             }
 
@@ -1659,5 +1692,17 @@ mod tests {
         assert_eq!((bad.w, bad.h), DEFAULT_SIZE);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Visit every Label under `root` (depth-first).
+fn for_each_label(root: &gtk4::Widget, f: &mut impl FnMut(&Label)) {
+    let mut child = root.first_child();
+    while let Some(w) = child {
+        if let Some(l) = w.downcast_ref::<Label>() {
+            f(l);
+        }
+        for_each_label(&w, f);
+        child = w.next_sibling();
     }
 }
